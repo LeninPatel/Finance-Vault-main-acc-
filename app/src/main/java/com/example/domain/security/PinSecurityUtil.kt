@@ -267,6 +267,114 @@ object VaultKeystoreCipher {
     }
 }
 
+/**
+ * Password-based AES-256-GCM encryption and SHA-256 integrity digest utility for Vault JSON Backups.
+ *
+ * Uses PBKDF2-HMAC-SHA256 (120,000 iterations, 128-bit random salt) to derive a 256-bit AES key
+ * and encrypts backup JSON with 96-bit random IV and 128-bit GCM authentication tag.
+ */
+object BackupPasswordCipher {
+    private const val KDF_ALGORITHM = "PBKDF2WithHmacSHA256"
+    private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val PBKDF2_ITERATIONS = 120_000
+    private const val KEY_BITS = 256
+    private const val GCM_TAG_BITS = 128
+    private val secureRandom = SecureRandom()
+
+    fun sha256Hex(content: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = digest.digest(content.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun encryptJsonWithPassword(plainJson: String, password: String): org.json.JSONObject {
+        val cleanPassword = password.trim()
+        require(cleanPassword.isNotEmpty()) { "Backup encryption password cannot be empty." }
+
+        val salt = ByteArray(16).also { secureRandom.nextBytes(it) }
+        val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+
+        val keySpec = PBEKeySpec(cleanPassword.toCharArray(), salt, PBKDF2_ITERATIONS, KEY_BITS)
+        val cipherBytes = try {
+            val skf = SecretKeyFactory.getInstance(KDF_ALGORITHM)
+            val rawKey = skf.generateSecret(keySpec).encoded
+            val aesKey = javax.crypto.spec.SecretKeySpec(rawKey, "AES")
+            val cipher = Cipher.getInstance(CIPHER_TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, aesKey, GCMParameterSpec(GCM_TAG_BITS, iv))
+            cipher.doFinal(plainJson.toByteArray(Charsets.UTF_8))
+        } finally {
+            keySpec.clearPassword()
+        }
+
+        return org.json.JSONObject().apply {
+            put("app", "FinanceVault")
+            put("schemaVersion", 2)
+            put("encrypted", true)
+            put("kdf", KDF_ALGORITHM)
+            put("iterations", PBKDF2_ITERATIONS)
+            put("cipher", CIPHER_TRANSFORMATION)
+            put("saltHex", bytesToHex(salt))
+            put("ivHex", bytesToHex(iv))
+            put("cipherHex", bytesToHex(cipherBytes))
+            put("plainSha256", sha256Hex(plainJson))
+        }
+    }
+
+    fun decryptJsonWithPassword(envelope: org.json.JSONObject, password: String): String {
+        val cleanPassword = password.trim()
+        require(cleanPassword.isNotEmpty()) { "Password is required to decrypt this backup file." }
+
+        val iterations = envelope.optInt("iterations", PBKDF2_ITERATIONS).coerceAtLeast(10_000)
+        val salt = hexToBytes(envelope.optString("saltHex", ""))
+        val iv = hexToBytes(envelope.optString("ivHex", ""))
+        val cipherBytes = hexToBytes(envelope.optString("cipherHex", ""))
+        require(salt.isNotEmpty() && iv.isNotEmpty() && cipherBytes.isNotEmpty()) {
+            "Encrypted backup envelope is missing cryptographic parameters."
+        }
+
+        val keySpec = PBEKeySpec(cleanPassword.toCharArray(), salt, iterations, KEY_BITS)
+        val decryptedJson = try {
+            val skf = SecretKeyFactory.getInstance(KDF_ALGORITHM)
+            val rawKey = skf.generateSecret(keySpec).encoded
+            val aesKey = javax.crypto.spec.SecretKeySpec(rawKey, "AES")
+            val cipher = Cipher.getInstance(CIPHER_TRANSFORMATION)
+            cipher.init(Cipher.DECRYPT_MODE, aesKey, GCMParameterSpec(GCM_TAG_BITS, iv))
+            String(cipher.doFinal(cipherBytes), Charsets.UTF_8)
+        } catch (e: Exception) {
+            throw IllegalArgumentException("Invalid backup password or corrupted encrypted backup payload.", e)
+        } finally {
+            keySpec.clearPassword()
+        }
+
+        val expectedSha = envelope.optString("plainSha256", "")
+        if (expectedSha.isNotBlank()) {
+            val actualSha = sha256Hex(decryptedJson)
+            require(
+                MessageDigest.isEqual(
+                    expectedSha.lowercase().toByteArray(Charsets.UTF_8),
+                    actualSha.lowercase().toByteArray(Charsets.UTF_8)
+                )
+            ) {
+                "Backup integrity check failed after decryption: SHA-256 digest mismatch."
+            }
+        }
+        return decryptedJson
+    }
+
+    private fun bytesToHex(bytes: ByteArray): String =
+        bytes.joinToString("") { "%02x".format(it) }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.trim()
+        if (clean.isEmpty() || clean.length % 2 != 0) return ByteArray(0)
+        return runCatching {
+            ByteArray(clean.length / 2) { i ->
+                clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
+        }.getOrDefault(ByteArray(0))
+    }
+}
+
 enum class BiometricAvailability(
     val canAuthenticate: Boolean,
     val statusMessage: String

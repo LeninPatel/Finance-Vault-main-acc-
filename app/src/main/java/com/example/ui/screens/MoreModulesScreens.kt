@@ -74,12 +74,14 @@ import com.example.data.local.AuditLogEntity
 import com.example.data.local.BillingFrequency
 import com.example.data.local.BudgetPeriod
 import com.example.data.local.GoalType
+import com.example.data.local.GiftCardEntity
 import com.example.data.local.LoanEntity
 import com.example.data.local.LoanType
 import com.example.data.local.TaxType
 import com.example.data.local.ThemeMode
 import com.example.data.local.TransactionType
 import com.example.domain.security.BiometricAuthHelper
+import com.example.domain.security.VaultKeystoreCipher
 import com.example.domain.calculators.FinancialCalculators
 import com.example.domain.money.InrMoney
 import com.example.domain.period.IndianFinancialYear
@@ -1303,6 +1305,49 @@ fun BudgetsAndGoalsScreen(
     }
 }
 
+private fun resolveGiftCardNameAndKind(gc: GiftCardEntity): Pair<String, String> {
+    val rawName = gc.name.trim()
+    val rawBrand = gc.brand.trim()
+    val rawNotes = gc.notes.trim()
+
+    if (rawName.contains("(") && rawName.endsWith(")")) {
+        val kindPart = rawName.substringAfterLast("(").substringBeforeLast(")").trim()
+        val namePart = rawName.substringBeforeLast("(").trim().ifBlank { rawBrand }
+        val resolvedKind = kindPart.ifBlank { rawNotes.ifBlank { "Gift Card" } }
+        return namePart to resolvedKind
+    }
+
+    val displayName = rawName.ifBlank { rawBrand }
+    val resolvedKind = when {
+        rawNotes.isNotBlank() -> rawNotes
+        rawBrand.isNotBlank() && !displayName.equals(rawBrand, ignoreCase = true) -> "$rawBrand Gift Card"
+        else -> "Gift Card Voucher"
+    }
+    return displayName to resolvedKind
+}
+
+@Composable
+private fun GiftCardDetailRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = VaultTextSecondary
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            color = VaultTextPrimary,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
 @Composable
 fun GiftCardsScreen(
     uiState: FinanceVaultUiState,
@@ -1312,6 +1357,7 @@ fun GiftCardsScreen(
 ) {
     BackHandler { onBack() }
     var showAdd by remember { mutableStateOf(false) }
+    var selectedGiftCard by remember { mutableStateOf<GiftCardEntity?>(null) }
     val isHidden = uiState.settings.isPrivacyModeEnabled
 
     LazyColumn(
@@ -1319,7 +1365,7 @@ fun GiftCardsScreen(
             .fillMaxSize()
             .testTag("gift_cards_screen"),
         contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
             Row(
@@ -1348,7 +1394,8 @@ fun GiftCardsScreen(
                 Button(
                     onClick = { showAdd = true },
                     colors = ButtonDefaults.buttonColors(containerColor = VaultEmerald),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier.testTag("add_gift_card_button")
                 ) {
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
@@ -1369,23 +1416,219 @@ fun GiftCardsScreen(
             }
         } else {
             items(uiState.giftCards, key = { it.id }) { gc ->
-                VaultGlassCard(accentColor = VaultGold) {
+                val (displayName, cardKind) = remember(gc.name, gc.brand, gc.notes) {
+                    resolveGiftCardNameAndKind(gc)
+                }
+                VaultGlassCard(
+                    accentColor = VaultGold,
+                    onClick = { selectedGiftCard = gc },
+                    modifier = Modifier.testTag("gift_card_item_${gc.id}")
+                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
-                            Text("${gc.brand} — ${gc.name}", style = MaterialTheme.typography.titleMedium, color = VaultTextPrimary)
-                            Text("Card: ${gc.cardNumberMasked} • PIN: ${gc.redemptionCodeProtected}", style = MaterialTheme.typography.labelSmall, color = VaultTextMuted)
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = displayName,
+                                style = MaterialTheme.typography.titleMedium,
+                                color = VaultTextPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = cardKind,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = VaultGold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(InrMoney.formatPaise(gc.remainingValuePaise, isHidden = isHidden), style = MaterialTheme.typography.titleMedium, color = VaultGold)
-                            Text("Initial: ${InrMoney.formatPaise(gc.initialValuePaise, isHidden = isHidden)}", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
-                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = "View gift card details",
+                            tint = VaultGold
+                        )
                     }
                 }
             }
         }
+    }
+
+    selectedGiftCard?.let { gc ->
+        val (displayName, cardKind) = remember(gc.name, gc.brand, gc.notes) {
+            resolveGiftCardNameAndKind(gc)
+        }
+        val usedPaise = (gc.initialValuePaise - gc.remainingValuePaise).coerceAtLeast(0L)
+        val remainingFraction = if (gc.initialValuePaise > 0L) {
+            (gc.remainingValuePaise.toFloat() / gc.initialValuePaise.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        val formattedPin = remember(gc.redemptionCodeProtected, isHidden) {
+            VaultKeystoreCipher.decryptOrFormatSensitiveField(gc.redemptionCodeProtected, isPrivacyActive = isHidden)
+        }
+        val linkedTxs = remember(uiState.transactions, gc.id) {
+            uiState.transactions.filter { it.linkedGiftCardId == gc.id && !it.isReversed }
+        }
+
+        AlertDialog(
+            onDismissRequest = { selectedGiftCard = null },
+            containerColor = VaultCardSurface,
+            modifier = Modifier.testTag("gift_card_detail_dialog"),
+            title = {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = displayName,
+                        style = MaterialTheme.typography.titleLarge,
+                        color = VaultTextPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = cardKind,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = VaultGold
+                    )
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(VaultObsidianBg)
+                            .border(1.dp, VaultGold.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text("Remaining Balance", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                                Text(
+                                    text = InrMoney.formatPaise(gc.remainingValuePaise, isHidden = isHidden),
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    color = VaultGold,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text("Initial Value", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                                Text(
+                                    text = InrMoney.formatPaise(gc.initialValuePaise, isHidden = isHidden),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = VaultTextPrimary
+                                )
+                            }
+                        }
+                        LinearProgressIndicator(
+                            progress = { remainingFraction },
+                            color = VaultGold,
+                            trackColor = VaultCardElevated,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                        )
+                        Text(
+                            text = "Used: ${InrMoney.formatPaise(usedPaise, isHidden = isHidden)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = VaultTextMuted
+                        )
+                    }
+
+                    HorizontalDivider(color = VaultCardElevated)
+
+                    GiftCardDetailRow(label = "Brand", value = gc.brand.ifBlank { displayName })
+                    GiftCardDetailRow(label = "Kind / Category", value = cardKind)
+                    GiftCardDetailRow(
+                        label = "Card Number",
+                        value = if (isHidden) "•••• ••••" else gc.cardNumberMasked.ifBlank { "Not provided" }
+                    )
+                    GiftCardDetailRow(
+                        label = "PIN / Redemption Code",
+                        value = formattedPin
+                    )
+                    GiftCardDetailRow(
+                        label = "Purchase Date",
+                        value = IndianFinancialYear.formatEpochDay(gc.purchaseDateEpochDay)
+                    )
+                    if (gc.expirationDateEpochDay != null) {
+                        GiftCardDetailRow(
+                            label = "Expiration Date",
+                            value = IndianFinancialYear.formatEpochDay(gc.expirationDateEpochDay)
+                        )
+                    }
+                    if (gc.notes.isNotBlank() && !gc.notes.equals(cardKind, ignoreCase = true)) {
+                        GiftCardDetailRow(label = "Notes", value = gc.notes)
+                    }
+
+                    if (linkedTxs.isNotEmpty()) {
+                        HorizontalDivider(color = VaultCardElevated)
+                        Text(
+                            text = "Card Activity (${linkedTxs.size})",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = VaultCyan,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        linkedTxs.forEach { tx ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = tx.description.ifBlank { tx.category },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = VaultTextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = VaultTextMuted
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = InrMoney.formatPaise(tx.amountPaise, isHidden = isHidden),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (tx.transactionType == TransactionType.GIFT_CARD_USAGE) VaultCoral else VaultEmerald,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { selectedGiftCard = null },
+                    modifier = Modifier.testTag("close_gift_card_detail_button")
+                ) {
+                    Text("Close", color = VaultGold)
+                }
+            }
+        )
     }
 
     if (showAdd) {
@@ -1435,7 +1678,7 @@ fun GiftCardsScreen(
                 return
             }
             val remP = InrMoney.parseInrToPaise(remainingInput) ?: initP
-            onAddGiftCard(brand, "$brand (${cardCategory!!})", initP, remP, cardNo, pinCode, null, "")
+            onAddGiftCard(brand, "$brand (${cardCategory!!})", initP, remP, cardNo, pinCode, null, cardCategory!!)
             showAdd = false
         }
 
@@ -2508,6 +2751,7 @@ fun TaxesScreen(
 @Composable
 fun SettingsAndAboutScreen(
     uiState: FinanceVaultUiState,
+    restorePreview: com.example.data.repository.BackupRestorePreview? = null,
     onUpdateProfileAndFy: (String, String, String) -> Unit,
     onUpdateThemeMode: (ThemeMode) -> Unit,
     onUpdatePin: (String?) -> Unit,
@@ -2517,9 +2761,12 @@ fun SettingsAndAboutScreen(
     onTogglePrivacy: () -> Unit,
     onToggleDemoMode: (Boolean) -> Unit,
     onToggleAiConsent: (Boolean) -> Unit = {},
+    onToggleLocationTagging: (Boolean) -> Unit = {},
     onUpdateAutoLockMinutes: (Int) -> Unit = {},
-    onExportJsonBackup: () -> Unit,
-    onRestoreJsonBackup: (String) -> Unit,
+    onExportJsonBackup: (String?) -> Unit,
+    onInspectJsonBackup: (String, String?) -> Unit = { _, _ -> },
+    onDismissRestorePreview: () -> Unit = {},
+    onRestoreJsonBackup: (String, String?, com.example.data.repository.BackupRestoreMode) -> Unit,
     onClearData: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -2533,8 +2780,10 @@ fun SettingsAndAboutScreen(
     var newPinInput by remember { mutableStateOf("") }
     var confirmNewPinInput by remember { mutableStateOf("") }
     var pinValidationError by remember { mutableStateOf<String?>(null) }
+    var backupPasswordInput by remember { mutableStateOf("") }
     var showRestoreDialog by remember { mutableStateOf(false) }
     var restoreJsonInput by remember { mutableStateOf("") }
+    var restorePasswordInput by remember { mutableStateOf("") }
     var showClearConfirm by remember { mutableStateOf(false) }
     var showAuditTrailDialog by remember { mutableStateOf(false) }
     val biometricAvailability = remember(context) { BiometricAuthHelper.checkBiometricAvailability(context) }
@@ -2715,6 +2964,30 @@ fun SettingsAndAboutScreen(
                             modifier = Modifier.testTag("settings_ai_consent_switch")
                         )
                     }
+                    HorizontalDivider(color = VaultCardElevated)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Opt-In GPS Location Tagging",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = VaultTextPrimary
+                            )
+                            Text(
+                                "Automatically attach local GPS coordinates to transactions (Never sent to Gemini AI)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = VaultTextSecondary
+                            )
+                        }
+                        VaultToggleSwitch(
+                            checked = uiState.settings.isLocationTaggingEnabled,
+                            onCheckedChange = { onToggleLocationTagging(it) },
+                            modifier = Modifier.testTag("settings_location_tagging_switch")
+                        )
+                    }
                 }
             }
         }
@@ -2883,7 +3156,7 @@ fun SettingsAndAboutScreen(
                     HorizontalDivider(color = VaultCardElevated)
 
                     Text(
-                        text = "Auto-Lock Background Timeout",
+                        text = "Auto-Lock Inactivity & Background Timeout",
                         style = MaterialTheme.typography.bodySmall,
                         color = VaultTextPrimary,
                         fontWeight = FontWeight.Medium
@@ -2931,15 +3204,37 @@ fun SettingsAndAboutScreen(
             VaultGlassCard(accentColor = VaultGold) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Backup, Restore & Data Control", style = MaterialTheme.typography.titleMedium, color = VaultTextPrimary)
+                    Text(
+                        text = "Full Versioned Vault Backup (Schema v2) • SHA-256 Integrity Checksum • Optional AES-256-GCM Password Encryption (Secrets & PIN hashes are never exported)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = VaultTextSecondary
+                    )
+                    OutlinedTextField(
+                        value = backupPasswordInput,
+                        onValueChange = { backupPasswordInput = it },
+                        label = { Text("Backup Encryption Password (Optional)") },
+                        placeholder = { Text("Leave blank for unencrypted JSON") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("backup_password_input")
+                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
-                            onClick = onExportJsonBackup,
+                            onClick = { onExportJsonBackup(backupPasswordInput.takeIf { it.isNotBlank() }) },
                             colors = ButtonDefaults.buttonColors(containerColor = VaultEmerald),
                             modifier = Modifier.testTag("export_json_backup_button")
                         ) {
                             Text("Export JSON Backup")
                         }
-                        OutlinedButton(onClick = { showRestoreDialog = true }) {
+                        OutlinedButton(
+                            onClick = {
+                                onDismissRestorePreview()
+                                showRestoreDialog = true
+                            },
+                            modifier = Modifier.testTag("open_restore_backup_dialog_button")
+                        ) {
                             Text("Restore Backup", color = VaultCyan)
                         }
                     }
@@ -3004,28 +3299,164 @@ fun SettingsAndAboutScreen(
 
     if (showRestoreDialog) {
         AlertDialog(
-            onDismissRequest = { showRestoreDialog = false },
+            onDismissRequest = {
+                onDismissRestorePreview()
+                showRestoreDialog = false
+            },
             containerColor = VaultCardSurface,
             title = { Text("Restore from JSON Backup", color = VaultTextPrimary) },
             text = {
-                OutlinedTextField(
-                    value = restoreJsonInput,
-                    onValueChange = { restoreJsonInput = it },
-                    label = { Text("Paste Finance Vault JSON Backup") },
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(160.dp)
-                )
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        value = restoreJsonInput,
+                        onValueChange = {
+                            restoreJsonInput = it
+                            onDismissRestorePreview()
+                        },
+                        label = { Text("Paste Finance Vault JSON Backup") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(140.dp)
+                            .testTag("restore_json_input")
+                    )
+                    OutlinedTextField(
+                        value = restorePasswordInput,
+                        onValueChange = {
+                            restorePasswordInput = it
+                            onDismissRestorePreview()
+                        },
+                        label = { Text("Decryption Password (If Encrypted)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("restore_password_input")
+                    )
+                    Button(
+                        onClick = {
+                            if (restoreJsonInput.isNotBlank()) {
+                                onInspectJsonBackup(
+                                    restoreJsonInput,
+                                    restorePasswordInput.takeIf { it.isNotBlank() }
+                                )
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = VaultCyan),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("preview_restore_backup_button")
+                    ) {
+                        Text("Validate & Preview Backup", color = VaultObsidianBg, fontWeight = FontWeight.Bold)
+                    }
+
+                    if (restorePreview != null) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(VaultObsidianBg)
+                                .border(1.dp, VaultEmerald.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                                .padding(10.dp)
+                                .testTag("backup_restore_preview_card"),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "Backup Preview Verified (Schema v${restorePreview.schemaVersion})",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = VaultEmerald,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "FY: ${restorePreview.activeFinancialYear} • " +
+                                    "Encrypted: ${if (restorePreview.isEncrypted) "Yes (AES-256-GCM)" else "No"} • " +
+                                    "Checksum Verified: ${if (restorePreview.isChecksumValid) "Yes" else "Legacy"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = VaultCyan
+                            )
+                            Text(
+                                text = "Total Records: ${restorePreview.totalRecordsCount}\n" +
+                                    "• Accounts: ${restorePreview.accountsCount} | Ledgers: ${restorePreview.ledgerAccountsCount}\n" +
+                                    "• Transactions: ${restorePreview.transactionsCount} | Vouchers: ${restorePreview.journalEntriesCount} (${restorePreview.journalLinesCount} lines)\n" +
+                                    "• Investments: ${restorePreview.investmentsCount} | Loans: ${restorePreview.loansCount} (${restorePreview.loanPaymentsCount} EMIs)\n" +
+                                    "• Budgets: ${restorePreview.budgetsCount} | Goals: ${restorePreview.goalsCount} | Gift Cards: ${restorePreview.giftCardsCount}\n" +
+                                    "• Subscriptions: ${restorePreview.subscriptionsCount} | Tax Records: ${restorePreview.taxRecordsCount}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = VaultTextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Choose how to handle existing records in this mode:",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = VaultGold,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        onRestoreJsonBackup(
+                                            restoreJsonInput,
+                                            restorePasswordInput.takeIf { it.isNotBlank() },
+                                            com.example.data.repository.BackupRestoreMode.MERGE_KEEP_EXISTING
+                                        )
+                                        showRestoreDialog = false
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = VaultEmerald),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("restore_merge_button")
+                                ) {
+                                    Text("Merge", color = VaultObsidianBg, fontWeight = FontWeight.Bold)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        onRestoreJsonBackup(
+                                            restoreJsonInput,
+                                            restorePasswordInput.takeIf { it.isNotBlank() },
+                                            com.example.data.repository.BackupRestoreMode.REPLACE_EXISTING
+                                        )
+                                        showRestoreDialog = false
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("restore_replace_button")
+                                ) {
+                                    Text("Replace All", color = VaultCoral, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
             },
             confirmButton = {
-                Button(onClick = {
-                    if (restoreJsonInput.isNotBlank()) {
-                        onRestoreJsonBackup(restoreJsonInput)
+                if (restorePreview == null) {
+                    Button(
+                        onClick = {
+                            if (restoreJsonInput.isNotBlank()) {
+                                onInspectJsonBackup(
+                                    restoreJsonInput,
+                                    restorePasswordInput.takeIf { it.isNotBlank() }
+                                )
+                            }
+                        }
+                    ) { Text("Preview Backup") }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        onDismissRestorePreview()
                         showRestoreDialog = false
                     }
-                }) { Text("Confirm Restore") }
-            },
-            dismissButton = { TextButton(onClick = { showRestoreDialog = false }) { Text("Cancel") } }
+                ) { Text("Cancel") }
+            }
         )
     }
 

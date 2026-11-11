@@ -25,7 +25,8 @@ data class AppSettingsEntity(
     val pinIterations: Int = 120000,
     val failedPinAttempts: Int = 0,
     val lockoutUntilEpochMillis: Long = 0L,
-    val isAiFinancialContextConsentGranted: Boolean = false
+    val isAiFinancialContextConsentGranted: Boolean = false,
+    val isLocationTaggingEnabled: Boolean = false
 )
 
 @Immutable

@@ -1,8 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Finance Vault Security Backup Policy (Android 11 and below):
+    Sensitive financial ledgers, PBKDF2 PIN credentials, and local export files are excluded
+    from automatic unencrypted/cloud backups. Users export encrypted AES-256-GCM JSON backups
+    explicitly via the Vault Backup & Restore module.
+-->
 <full-backup-content>
     <exclude domain="database" path="finance_vault.db" />
     <exclude domain="database" path="finance_vault.db-wal" />
     <exclude domain="database" path="finance_vault.db-shm" />
+    <exclude domain="database" path="finance_vault.db-journal" />
+    <exclude domain="database" path="." />
     <exclude domain="sharedpref" path="." />
+    <exclude domain="file" path="datastore" />
+    <exclude domain="file" path="exports" />
 </full-backup-content>
 

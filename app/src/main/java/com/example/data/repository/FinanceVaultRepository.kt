@@ -33,6 +33,7 @@ import com.example.domain.accounting.AccountingEngine
 import com.example.domain.calculators.FinancialCalculators
 import com.example.domain.money.InrMoney
 import com.example.domain.period.IndianFinancialYear
+import com.example.domain.security.BackupPasswordCipher
 import com.example.domain.security.PinSecurityUtil
 import com.example.domain.security.VaultKeystoreCipher
 import kotlinx.coroutines.flow.Flow
@@ -40,12 +41,48 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 sealed class PinVerificationResult {
     data object Success : PinVerificationResult()
     data class InvalidPin(val failedAttempts: Int, val lockoutDurationMillis: Long) : PinVerificationResult()
     data class LockedOut(val remainingSeconds: Long) : PinVerificationResult()
+}
+
+enum class BackupRestoreMode(val displayLabel: String) {
+    REPLACE_EXISTING("Replace Existing Vault Data"),
+    MERGE_KEEP_EXISTING("Merge & Skip Duplicates")
+}
+
+data class BackupRestorePreview(
+    val schemaVersion: Int,
+    val exportedAtMillis: Long,
+    val userName: String,
+    val activeFinancialYear: String,
+    val isEncrypted: Boolean,
+    val isChecksumValid: Boolean,
+    val accountsCount: Int,
+    val ledgerAccountsCount: Int,
+    val transactionsCount: Int,
+    val journalEntriesCount: Int,
+    val journalLinesCount: Int,
+    val investmentsCount: Int,
+    val loansCount: Int,
+    val loanPaymentsCount: Int,
+    val budgetsCount: Int,
+    val goalsCount: Int,
+    val giftCardsCount: Int,
+    val subscriptionsCount: Int,
+    val taxRecordsCount: Int,
+    val auditLogsCount: Int
+) {
+    val checksumVerified: Boolean
+        get() = isChecksumValid
+
+    val totalRecordsCount: Int
+        get() = accountsCount + transactionsCount + investmentsCount + loansCount +
+            budgetsCount + goalsCount + giftCardsCount + subscriptionsCount + taxRecordsCount
 }
 
 /**
@@ -78,6 +115,56 @@ class FinanceVaultRepository(
     fun observeSubscriptions(isDemo: Boolean): Flow<List<SubscriptionEntity>> = dao.observeSubscriptions(isDemo).distinctUntilChanged()
     fun observeTaxRecords(isDemo: Boolean): Flow<List<TaxRecordEntity>> = dao.observeTaxRecords(isDemo).distinctUntilChanged()
     fun observeAuditLogs(isDemo: Boolean): Flow<List<AuditLogEntity>> = dao.observeAuditLogs(isDemo).distinctUntilChanged()
+
+    private suspend fun requireAccountInMode(accountId: Long?, expectedIsDemo: Boolean, role: String): AccountEntity? {
+        if (accountId == null) return null
+        val acc = dao.getAccountById(accountId)
+            ?: throw IllegalArgumentException("$role account (id=$accountId) does not exist.")
+        require(acc.isDemo == expectedIsDemo) {
+            "Cross-mode reference violation: $role account '${acc.name}' belongs to ${if (acc.isDemo) "Demo" else "Real"} mode, cannot be used in ${if (expectedIsDemo) "Demo" else "Real"} mode."
+        }
+        return acc
+    }
+
+    private suspend fun requireInvestmentInMode(investmentId: Long?, expectedIsDemo: Boolean): InvestmentEntity? {
+        if (investmentId == null) return null
+        val inv = dao.getInvestmentById(investmentId)
+            ?: throw IllegalArgumentException("Investment (id=$investmentId) does not exist.")
+        require(inv.isDemo == expectedIsDemo) {
+            "Cross-mode reference violation: Investment '${inv.name}' belongs to ${if (inv.isDemo) "Demo" else "Real"} mode, cannot be used in ${if (expectedIsDemo) "Demo" else "Real"} mode."
+        }
+        return inv
+    }
+
+    private suspend fun requireLoanInMode(loanId: Long?, expectedIsDemo: Boolean): LoanEntity? {
+        if (loanId == null) return null
+        val loan = dao.getLoanById(loanId)
+            ?: throw IllegalArgumentException("Loan (id=$loanId) does not exist.")
+        require(loan.isDemo == expectedIsDemo) {
+            "Cross-mode reference violation: Loan '${loan.name}' belongs to ${if (loan.isDemo) "Demo" else "Real"} mode, cannot be used in ${if (expectedIsDemo) "Demo" else "Real"} mode."
+        }
+        return loan
+    }
+
+    private suspend fun requireGiftCardInMode(giftCardId: Long?, expectedIsDemo: Boolean): GiftCardEntity? {
+        if (giftCardId == null) return null
+        val card = dao.getGiftCardById(giftCardId)
+            ?: throw IllegalArgumentException("Gift card (id=$giftCardId) does not exist.")
+        require(card.isDemo == expectedIsDemo) {
+            "Cross-mode reference violation: Gift card '${card.name}' belongs to ${if (card.isDemo) "Demo" else "Real"} mode, cannot be used in ${if (expectedIsDemo) "Demo" else "Real"} mode."
+        }
+        return card
+    }
+
+    private suspend fun requireOriginalTransactionInMode(origTxId: Long?, expectedIsDemo: Boolean): TransactionEntity? {
+        if (origTxId == null) return null
+        val orig = dao.getTransactionById(origTxId)
+            ?: throw IllegalArgumentException("Referenced original transaction (id=$origTxId) does not exist.")
+        require(orig.isDemo == expectedIsDemo) {
+            "Cross-mode reference violation: Original transaction '${orig.voucherNumber}' belongs to ${if (orig.isDemo) "Demo" else "Real"} mode, cannot be linked in ${if (expectedIsDemo) "Demo" else "Real"} mode."
+        }
+        return orig
+    }
 
     /**
      * Ensures default settings and the standard Indian Personal Chart of Accounts exist.
@@ -193,6 +280,8 @@ class FinanceVaultRepository(
         isDemo: Boolean = false
     ): Long {
         require(name.isNotBlank()) { "Account name is required." }
+        require(openingBalancePaise >= 0L) { "Opening balance cannot be negative ($openingBalancePaise paise)." }
+        creditLimitPaise?.let { require(it >= 0L) { "Credit limit cannot be negative." } }
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
             val accountId = dao.insertAccount(
@@ -259,8 +348,13 @@ class FinanceVaultRepository(
         }
     }
 
-    suspend fun archiveAccount(accountId: Long, archive: Boolean) {
+    suspend fun archiveAccount(accountId: Long, archive: Boolean, expectedIsDemo: Boolean? = null) {
         val existing = dao.getAccountById(accountId) ?: return
+        if (expectedIsDemo != null) {
+            require(existing.isDemo == expectedIsDemo) {
+                "Cross-mode reference violation: cannot archive account '${existing.name}' across Demo/Real boundaries."
+            }
+        }
         dao.updateAccount(existing.copy(isArchived = archive))
     }
 
@@ -293,6 +387,10 @@ class FinanceVaultRepository(
         isDemo: Boolean = false
     ): Long {
         require(amountPaise > 0L) { "Transaction amount must be greater than ₹0." }
+        require(principalComponentPaise >= 0L) { "Principal component cannot be negative." }
+        require(interestComponentPaise >= 0L) { "Interest component cannot be negative." }
+        require(chargesPaise >= 0L) { "Charges cannot be negative." }
+        require(costBasisDisposedPaise >= 0L) { "Disposed cost basis cannot be negative." }
 
         if (!isDemo) {
             val nowMs = System.currentTimeMillis()
@@ -307,6 +405,75 @@ class FinanceVaultRepository(
 
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
+
+            // Enforce strict Demo / Real mode isolation on all linked foreign keys
+            requireAccountInMode(sourceAccountId, isDemo, "Source")
+            requireAccountInMode(destinationAccountId, isDemo, "Destination")
+            val linkedInv = requireInvestmentInMode(linkedInvestmentId, isDemo)
+            val linkedLoan = requireLoanInMode(linkedLoanId, isDemo)
+            val linkedCard = requireGiftCardInMode(linkedGiftCardId, isDemo)
+            val linkedOrigTx = requireOriginalTransactionInMode(linkedOriginalTransactionId, isDemo)
+
+            // Domain-level accounting validations before posting
+            var resolvedCostBasisDisposed = costBasisDisposedPaise
+            if (transactionType == TransactionType.INVESTMENT_SALE) {
+                require(amountPaise > chargesPaise) {
+                    "Sale proceeds ($amountPaise paise) must exceed sale brokerage/charges ($chargesPaise paise)."
+                }
+                if (linkedInv != null) {
+                    require(!linkedInv.isFullyRedeemed && linkedInv.investedAmountPaise > 0L) {
+                        "Cannot record sale against a fully redeemed investment with ₹0 remaining cost basis."
+                    }
+                    if (costBasisDisposedPaise > 0L) {
+                        require(costBasisDisposedPaise <= linkedInv.investedAmountPaise) {
+                            "Disposed cost basis ($costBasisDisposedPaise paise) cannot exceed remaining invested cost basis (${linkedInv.investedAmountPaise} paise)."
+                        }
+                    } else {
+                        resolvedCostBasisDisposed = minOf(amountPaise, linkedInv.investedAmountPaise)
+                    }
+                } else {
+                    require(costBasisDisposedPaise > 0L) {
+                        "Cost basis disposed must be greater than ₹0 when selling an investment without a linked holding."
+                    }
+                }
+            }
+
+            if (transactionType == TransactionType.REFUND_RECEIVED && linkedOrigTx != null) {
+                require(!linkedOrigTx.isReversed) {
+                    "Cannot record a refund against a reversed transaction (${linkedOrigTx.voucherNumber})."
+                }
+                require(
+                    linkedOrigTx.transactionType == TransactionType.EXPENSE ||
+                        linkedOrigTx.transactionType == TransactionType.CREDIT_CARD_PURCHASE
+                ) {
+                    "Refunds can only be linked to an Expense or Credit Card Purchase transaction."
+                }
+                val priorRefunds = dao.getActiveRefundsForOriginalTransaction(linkedOrigTx.id, isDemo)
+                val cumulativeRefunded = priorRefunds.fold(0L) { acc, r ->
+                    AccountingEngine.safeAddPaise(acc, r.amountPaise)
+                }
+                val newTotalRefunded = AccountingEngine.safeAddPaise(cumulativeRefunded, amountPaise)
+                require(newTotalRefunded <= linkedOrigTx.amountPaise) {
+                    "Refund amount ($amountPaise paise) plus prior refunds ($cumulativeRefunded paise) cannot exceed original expense (${linkedOrigTx.amountPaise} paise)."
+                }
+            }
+
+            if (transactionType == TransactionType.LOAN_REPAYMENT && linkedLoan != null) {
+                val principalPaid = if (principalComponentPaise > 0L || interestComponentPaise > 0L) {
+                    principalComponentPaise
+                } else {
+                    amountPaise
+                }
+                require(principalPaid <= linkedLoan.remainingPrincipalPaise) {
+                    "Loan principal repayment ($principalPaid paise) cannot exceed remaining loan principal (${linkedLoan.remainingPrincipalPaise} paise)."
+                }
+            }
+
+            if (transactionType == TransactionType.GIFT_CARD_USAGE && linkedCard != null) {
+                require(amountPaise <= linkedCard.remainingValuePaise) {
+                    "Gift card usage ($amountPaise paise) cannot exceed remaining gift card balance (${linkedCard.remainingValuePaise} paise)."
+                }
+            }
 
             val sourceUserLedger = sourceAccountId?.let { dao.getLedgerByUserAccountId(it, isDemo) }
             val destUserLedger = destinationAccountId?.let { dao.getLedgerByUserAccountId(it, isDemo) }
@@ -328,8 +495,7 @@ class FinanceVaultRepository(
                 TransactionType.BANK_CHARGE -> LedgerClassification.EXPENSE_BANK_CHARGES
                 TransactionType.TAX_PAYMENT -> LedgerClassification.EXPENSE_TAXES
                 TransactionType.REFUND_RECEIVED -> {
-                    val origTx = linkedOriginalTransactionId?.let { dao.getTransactionById(it) }
-                    val origCat = origTx?.category ?: category
+                    val origCat = linkedOrigTx?.category ?: category
                     AccountingEngine.resolveExpenseClassification(origCat)
                 }
                 else -> AccountingEngine.resolveExpenseClassification(category)
@@ -359,7 +525,7 @@ class FinanceVaultRepository(
                 principalComponentPaise = principalComponentPaise,
                 interestComponentPaise = interestComponentPaise,
                 chargesPaise = chargesPaise,
-                costBasisDisposedPaise = costBasisDisposedPaise,
+                costBasisDisposedPaise = resolvedCostBasisDisposed,
                 description = description.ifBlank { category.ifBlank { transactionType.userLabel } },
                 sourceLedger = effectiveSourceLedger,
                 destinationLedger = effectiveDestLedger,
@@ -380,7 +546,7 @@ class FinanceVaultRepository(
                 principalComponentPaise = principalComponentPaise,
                 interestComponentPaise = interestComponentPaise,
                 chargesPaise = chargesPaise,
-                costBasisDisposedPaise = costBasisDisposedPaise,
+                costBasisDisposedPaise = resolvedCostBasisDisposed,
                 sourceAccountId = sourceAccountId,
                 destinationAccountId = destinationAccountId,
                 category = category.ifBlank { transactionType.userLabel },
@@ -399,111 +565,105 @@ class FinanceVaultRepository(
             )
 
             // Update linked domain entities (Investments, Loans, Gift Cards)
-            if (linkedInvestmentId != null) {
-                val inv = dao.getInvestmentById(linkedInvestmentId)
-                if (inv != null) {
-                    when (transactionType) {
-                        TransactionType.INVESTMENT_PURCHASE,
-                        TransactionType.RD_CONTRIBUTION -> {
-                            val newInvested = inv.investedAmountPaise + amountPaise
-                            val newCurrent = inv.currentRecordedValuePaise?.plus(amountPaise)
-                            dao.updateInvestment(
-                                inv.copy(
-                                    investedAmountPaise = newInvested,
-                                    chargesPaise = inv.chargesPaise + chargesPaise,
-                                    currentRecordedValuePaise = newCurrent
-                                )
+            if (linkedInv != null) {
+                when (transactionType) {
+                    TransactionType.INVESTMENT_PURCHASE,
+                    TransactionType.RD_CONTRIBUTION -> {
+                        val newInvested = AccountingEngine.safeAddPaise(linkedInv.investedAmountPaise, amountPaise)
+                        val newCurrent = linkedInv.currentRecordedValuePaise?.let { AccountingEngine.safeAddPaise(it, amountPaise) }
+                        dao.updateInvestment(
+                            linkedInv.copy(
+                                investedAmountPaise = newInvested,
+                                chargesPaise = AccountingEngine.safeAddPaise(linkedInv.chargesPaise, chargesPaise),
+                                currentRecordedValuePaise = newCurrent
                             )
-                        }
-                        TransactionType.INVESTMENT_SALE -> {
-                            val costDisposed = if (costBasisDisposedPaise > 0L) costBasisDisposedPaise else amountPaise
-                            val gain = amountPaise - costDisposed - chargesPaise
-                            val remainingInvested = (inv.investedAmountPaise - costDisposed).coerceAtLeast(0L)
-                            val updatedCurrent = inv.currentRecordedValuePaise?.let { (it - amountPaise).coerceAtLeast(0L) }
-                            dao.updateInvestment(
-                                inv.copy(
-                                    investedAmountPaise = remainingInvested,
-                                    currentRecordedValuePaise = updatedCurrent,
-                                    realizedProfitLossPaise = inv.realizedProfitLossPaise + gain,
-                                    isFullyRedeemed = remainingInvested == 0L
-                                )
-                            )
-                        }
-                        TransactionType.FD_MATURITY,
-                        TransactionType.RD_MATURITY -> {
-                            val principal = if (principalComponentPaise > 0L) principalComponentPaise else inv.investedAmountPaise
-                            val interest = (amountPaise - principal).coerceAtLeast(0L)
-                            val remaining = (inv.investedAmountPaise - principal).coerceAtLeast(0L)
-                            dao.updateInvestment(
-                                inv.copy(
-                                    investedAmountPaise = remaining,
-                                    currentRecordedValuePaise = if (remaining == 0L) 0L else inv.currentRecordedValuePaise,
-                                    interestEarnedPaise = inv.interestEarnedPaise + interest,
-                                    isFullyRedeemed = remaining == 0L
-                                )
-                            )
-                        }
-                        TransactionType.INTEREST_RECEIVED -> {
-                            dao.updateInvestment(inv.copy(interestEarnedPaise = inv.interestEarnedPaise + amountPaise))
-                        }
-                        TransactionType.DIVIDEND_RECEIVED -> {
-                            dao.updateInvestment(inv.copy(dividendsReceivedPaise = inv.dividendsReceivedPaise + amountPaise))
-                        }
-                        else -> {}
+                        )
                     }
+                    TransactionType.INVESTMENT_SALE -> {
+                        val costDisposed = if (resolvedCostBasisDisposed > 0L) resolvedCostBasisDisposed else amountPaise
+                        val gain = AccountingEngine.safeSubtractPaise(
+                            AccountingEngine.safeSubtractPaise(amountPaise, costDisposed),
+                            chargesPaise
+                        )
+                        val remainingInvested = (linkedInv.investedAmountPaise - costDisposed).coerceAtLeast(0L)
+                        val updatedCurrent = linkedInv.currentRecordedValuePaise?.let { (it - amountPaise).coerceAtLeast(0L) }
+                        dao.updateInvestment(
+                            linkedInv.copy(
+                                investedAmountPaise = remainingInvested,
+                                currentRecordedValuePaise = updatedCurrent,
+                                realizedProfitLossPaise = AccountingEngine.safeAddPaise(linkedInv.realizedProfitLossPaise, gain),
+                                isFullyRedeemed = remainingInvested == 0L
+                            )
+                        )
+                    }
+                    TransactionType.FD_MATURITY,
+                    TransactionType.RD_MATURITY -> {
+                        val principal = if (principalComponentPaise > 0L) principalComponentPaise else linkedInv.investedAmountPaise
+                        val interest = (amountPaise - principal).coerceAtLeast(0L)
+                        val remaining = (linkedInv.investedAmountPaise - principal).coerceAtLeast(0L)
+                        dao.updateInvestment(
+                            linkedInv.copy(
+                                investedAmountPaise = remaining,
+                                currentRecordedValuePaise = if (remaining == 0L) 0L else linkedInv.currentRecordedValuePaise,
+                                interestEarnedPaise = AccountingEngine.safeAddPaise(linkedInv.interestEarnedPaise, interest),
+                                isFullyRedeemed = remaining == 0L
+                            )
+                        )
+                    }
+                    TransactionType.INTEREST_RECEIVED -> {
+                        dao.updateInvestment(linkedInv.copy(interestEarnedPaise = AccountingEngine.safeAddPaise(linkedInv.interestEarnedPaise, amountPaise)))
+                    }
+                    TransactionType.DIVIDEND_RECEIVED -> {
+                        dao.updateInvestment(linkedInv.copy(dividendsReceivedPaise = AccountingEngine.safeAddPaise(linkedInv.dividendsReceivedPaise, amountPaise)))
+                    }
+                    else -> {}
                 }
             }
 
-            if (linkedLoanId != null && transactionType == TransactionType.LOAN_REPAYMENT) {
-                val loan = dao.getLoanById(linkedLoanId)
-                if (loan != null) {
-                    val principalPaid = if (principalComponentPaise > 0L || interestComponentPaise > 0L) {
-                        principalComponentPaise
-                    } else {
-                        amountPaise
-                    }
-                    val interestPaid = if (principalComponentPaise > 0L || interestComponentPaise > 0L) {
-                        interestComponentPaise
-                    } else {
-                        0L
-                    }
-                    val newRemaining = (loan.remainingPrincipalPaise - principalPaid).coerceAtLeast(0L)
-                    val newRemainingInst = (loan.remainingInstallments - 1).coerceAtLeast(0)
-                    dao.updateLoan(
-                        loan.copy(
-                            remainingPrincipalPaise = newRemaining,
-                            remainingInstallments = if (newRemaining == 0L) 0 else newRemainingInst,
-                            totalInterestPaidPaise = loan.totalInterestPaidPaise + interestPaid,
-                            isClosed = newRemaining == 0L
-                        )
-                    )
-                    dao.insertLoanPayment(
-                        LoanPaymentEntity(
-                            loanId = loan.id,
-                            transactionId = txId,
-                            dateEpochDay = dateEpochDay,
-                            totalPaymentPaise = amountPaise,
-                            principalComponentPaise = principalPaid,
-                            interestComponentPaise = interestPaid,
-                            remainingPrincipalAfterPaise = newRemaining,
-                            isDemo = isDemo
-                        )
-                    )
+            if (linkedLoan != null && transactionType == TransactionType.LOAN_REPAYMENT) {
+                val principalPaid = if (principalComponentPaise > 0L || interestComponentPaise > 0L) {
+                    principalComponentPaise
+                } else {
+                    amountPaise
                 }
+                val interestPaid = if (principalComponentPaise > 0L || interestComponentPaise > 0L) {
+                    interestComponentPaise
+                } else {
+                    0L
+                }
+                val newRemaining = (linkedLoan.remainingPrincipalPaise - principalPaid).coerceAtLeast(0L)
+                val newRemainingInst = (linkedLoan.remainingInstallments - 1).coerceAtLeast(0)
+                dao.updateLoan(
+                    linkedLoan.copy(
+                        remainingPrincipalPaise = newRemaining,
+                        remainingInstallments = if (newRemaining == 0L) 0 else newRemainingInst,
+                        totalInterestPaidPaise = AccountingEngine.safeAddPaise(linkedLoan.totalInterestPaidPaise, interestPaid),
+                        isClosed = newRemaining == 0L
+                    )
+                )
+                dao.insertLoanPayment(
+                    LoanPaymentEntity(
+                        loanId = linkedLoan.id,
+                        transactionId = txId,
+                        dateEpochDay = dateEpochDay,
+                        totalPaymentPaise = amountPaise,
+                        principalComponentPaise = principalPaid,
+                        interestComponentPaise = interestPaid,
+                        remainingPrincipalAfterPaise = newRemaining,
+                        isDemo = isDemo
+                    )
+                )
             }
 
-            if (linkedGiftCardId != null) {
-                val card = dao.getGiftCardById(linkedGiftCardId)
-                if (card != null) {
-                    if (transactionType == TransactionType.GIFT_CARD_USAGE) {
-                        dao.updateGiftCard(
-                            card.copy(remainingValuePaise = (card.remainingValuePaise - amountPaise).coerceAtLeast(0L))
-                        )
-                    } else if (transactionType == TransactionType.GIFT_CARD_PURCHASE) {
-                        dao.updateGiftCard(
-                            card.copy(remainingValuePaise = card.remainingValuePaise + amountPaise)
-                        )
-                    }
+            if (linkedCard != null) {
+                if (transactionType == TransactionType.GIFT_CARD_USAGE) {
+                    dao.updateGiftCard(
+                        linkedCard.copy(remainingValuePaise = (linkedCard.remainingValuePaise - amountPaise).coerceAtLeast(0L))
+                    )
+                } else if (transactionType == TransactionType.GIFT_CARD_PURCHASE) {
+                    dao.updateGiftCard(
+                        linkedCard.copy(remainingValuePaise = AccountingEngine.safeAddPaise(linkedCard.remainingValuePaise, amountPaise))
+                    )
                 }
             }
 
@@ -613,11 +773,17 @@ class FinanceVaultRepository(
      * Reverses an existing transaction by marking it reversed in the ledger history,
      * generating an offsetting double-entry journal entry, and restoring linked entity balances.
      */
-    suspend fun reverseTransaction(transactionId: Long) {
+    suspend fun reverseTransaction(transactionId: Long, expectedIsDemo: Boolean? = null, reason: String = "") {
         database.withTransaction {
             val origTx = dao.getTransactionById(transactionId) ?: return@withTransaction
+            if (expectedIsDemo != null) {
+                require(origTx.isDemo == expectedIsDemo) {
+                    "Cross-mode reference violation: cannot reverse ${if (origTx.isDemo) "Demo" else "Real"} transaction '${origTx.voucherNumber}' from ${if (expectedIsDemo) "Demo" else "Real"} mode."
+                }
+            }
             if (origTx.isReversed) return@withTransaction
-            val origEntry = dao.getJournalEntryForTransaction(transactionId)
+            val origEntry = dao.getJournalEntryForTransactionAndMode(transactionId, origTx.isDemo)
+                ?: dao.getJournalEntryForTransaction(transactionId)
             val allLedgers = dao.getLedgerAccounts(origTx.isDemo).associateBy { it.id }
 
             dao.updateTransaction(origTx.copy(isReversed = true))
@@ -633,12 +799,19 @@ class FinanceVaultRepository(
 
                 dao.updateJournalEntry(origEntry.copy(postingStatus = PostingStatus.REVERSED))
 
+                val cleanReason = reason.trim()
+                val narrationWithReason = if (cleanReason.isNotBlank()) {
+                    "${reversalPlan.narration} ($cleanReason)"
+                } else {
+                    reversalPlan.narration
+                }
+
                 val revEntryId = dao.insertJournalEntry(
                     JournalEntryEntity(
                         transactionId = origTx.id,
                         voucherNumber = reversalVoucher,
                         dateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        narration = reversalPlan.narration,
+                        narration = narrationWithReason,
                         financialYear = IndianFinancialYear.currentFyLabel(),
                         postingStatus = PostingStatus.POSTED,
                         isReversal = true,
@@ -667,7 +840,7 @@ class FinanceVaultRepository(
 
             // Restore linked Investment, Loan, or Gift Card balances when reversed
             origTx.linkedInvestmentId?.let { invId ->
-                val inv = dao.getInvestmentById(invId)
+                val inv = dao.getInvestmentByIdAndMode(invId, origTx.isDemo)
                 if (inv != null) {
                     when (origTx.transactionType) {
                         TransactionType.INVESTMENT_PURCHASE,
@@ -685,8 +858,8 @@ class FinanceVaultRepository(
                         TransactionType.INVESTMENT_SALE -> {
                             val costDisposed = if (origTx.costBasisDisposedPaise > 0L) origTx.costBasisDisposedPaise else origTx.amountPaise
                             val gain = origTx.amountPaise - costDisposed - origTx.chargesPaise
-                            val restoredInvested = inv.investedAmountPaise + costDisposed
-                            val restoredCurrent = inv.currentRecordedValuePaise?.plus(origTx.amountPaise)
+                            val restoredInvested = AccountingEngine.safeAddPaise(inv.investedAmountPaise, costDisposed)
+                            val restoredCurrent = inv.currentRecordedValuePaise?.let { AccountingEngine.safeAddPaise(it, origTx.amountPaise) }
                             dao.updateInvestment(
                                 inv.copy(
                                     investedAmountPaise = restoredInvested,
@@ -709,7 +882,7 @@ class FinanceVaultRepository(
 
             origTx.linkedLoanId?.let { loanId ->
                 if (origTx.transactionType == TransactionType.LOAN_REPAYMENT) {
-                    val loan = dao.getLoanById(loanId)
+                    val loan = dao.getLoanByIdAndMode(loanId, origTx.isDemo)
                     if (loan != null) {
                         val principalPaid = if (origTx.principalComponentPaise > 0L || origTx.interestComponentPaise > 0L) {
                             origTx.principalComponentPaise
@@ -721,7 +894,7 @@ class FinanceVaultRepository(
                         } else {
                             0L
                         }
-                        val restoredRemaining = loan.remainingPrincipalPaise + principalPaid
+                        val restoredRemaining = AccountingEngine.safeAddPaise(loan.remainingPrincipalPaise, principalPaid)
                         dao.updateLoan(
                             loan.copy(
                                 remainingPrincipalPaise = restoredRemaining,
@@ -735,11 +908,11 @@ class FinanceVaultRepository(
             }
 
             origTx.linkedGiftCardId?.let { gcId ->
-                val card = dao.getGiftCardById(gcId)
+                val card = dao.getGiftCardByIdAndMode(gcId, origTx.isDemo)
                 if (card != null) {
                     if (origTx.transactionType == TransactionType.GIFT_CARD_USAGE) {
                         dao.updateGiftCard(
-                            card.copy(remainingValuePaise = card.remainingValuePaise + origTx.amountPaise)
+                            card.copy(remainingValuePaise = AccountingEngine.safeAddPaise(card.remainingValuePaise, origTx.amountPaise))
                         )
                     } else if (origTx.transactionType == TransactionType.GIFT_CARD_PURCHASE) {
                         dao.updateGiftCard(
@@ -749,12 +922,13 @@ class FinanceVaultRepository(
                 }
             }
 
+            val reasonSuffix = if (reason.isNotBlank()) " • Reason: ${reason.trim()}" else ""
             dao.insertAuditLog(
                 AuditLogEntity(
                     action = "VOUCHER_REVERSED",
                     entityType = "Transaction",
                     entityId = origTx.id,
-                    summary = "Reversed ${origTx.voucherNumber} (${InrMoney.formatPaise(origTx.amountPaise)}) • ${origTx.description}",
+                    summary = "Reversed ${origTx.voucherNumber} (${InrMoney.formatPaise(origTx.amountPaise)}) • ${origTx.description}$reasonSuffix",
                     isDemo = origTx.isDemo
                 )
             )
@@ -765,14 +939,19 @@ class FinanceVaultRepository(
      * Reverses multiple selected transactions atomically in a single SQLite transaction
      * by posting offsetting double-entry journal vouchers.
      */
-    suspend fun reverseTransactionsBulk(transactionIds: Set<Long>): Int {
+    suspend fun reverseTransactionsBulk(transactionIds: Set<Long>, expectedIsDemo: Boolean? = null): Int {
         if (transactionIds.isEmpty()) return 0
         var count = 0
         database.withTransaction {
             val txs = dao.getTransactionsByIds(transactionIds.toList())
             for (origTx in txs) {
+                if (expectedIsDemo != null) {
+                    require(origTx.isDemo == expectedIsDemo) {
+                        "Cross-mode reference violation in bulk reversal."
+                    }
+                }
                 if (!origTx.isReversed) {
-                    reverseTransaction(origTx.id)
+                    reverseTransaction(origTx.id, expectedIsDemo)
                     count++
                 }
             }
@@ -784,13 +963,18 @@ class FinanceVaultRepository(
      * Updates the category for multiple selected transactions and synchronizes their income/expense
      * double-entry journal lines so all financial statements remain reconciled.
      */
-    suspend fun categorizeTransactionsBulk(transactionIds: Set<Long>, newCategory: String): Int {
+    suspend fun categorizeTransactionsBulk(transactionIds: Set<Long>, newCategory: String, expectedIsDemo: Boolean? = null): Int {
         val cleanCategory = newCategory.trim()
         if (cleanCategory.isEmpty() || transactionIds.isEmpty()) return 0
         var updatedCount = 0
         database.withTransaction {
             for (id in transactionIds) {
                 val tx = dao.getTransactionById(id) ?: continue
+                if (expectedIsDemo != null) {
+                    require(tx.isDemo == expectedIsDemo) {
+                        "Cross-mode reference violation in bulk categorization."
+                    }
+                }
                 dao.updateTransaction(tx.copy(category = cleanCategory))
 
                 if (tx.transactionType == TransactionType.EXPENSE || tx.transactionType == TransactionType.INCOME) {
@@ -850,6 +1034,9 @@ class FinanceVaultRepository(
             require(!origTx.isReversed) { "Reversed transactions cannot be edited." }
             val isDemo = origTx.isDemo
             ensureSystemChartOfAccounts(isDemo)
+
+            requireAccountInMode(sourceAccountId, isDemo, "Source")
+            requireAccountInMode(destinationAccountId, isDemo, "Destination")
 
             val sourceUserLedger = sourceAccountId?.let { dao.getLedgerByUserAccountId(it, isDemo) }
             val destUserLedger = destinationAccountId?.let { dao.getLedgerByUserAccountId(it, isDemo) }
@@ -997,6 +1184,9 @@ class FinanceVaultRepository(
     ): Long {
         require(name.isNotBlank()) { "Investment name is required." }
         require(investedAmountPaise > 0L) { "Invested amount must be greater than ₹0." }
+        require(chargesPaise >= 0L) { "Investment charges cannot be negative." }
+        require(dividendsReceivedPaise >= 0L && interestEarnedPaise >= 0L) { "Dividends and interest cannot be negative." }
+        currentRecordedValuePaise?.let { require(it >= 0L) { "Current recorded value cannot be negative." } }
 
         val today = IndianFinancialYear.todayEpochDay()
         val holdingDays = (today - purchaseDateEpochDay).coerceAtLeast(1L)
@@ -1011,7 +1201,7 @@ class FinanceVaultRepository(
             durationMonths = durationMonths,
             holdingDays = holdingDays,
             chargesPaise = chargesPaise,
-            dividendsAndInterestPaise = dividendsReceivedPaise + interestEarnedPaise,
+            dividendsAndInterestPaise = AccountingEngine.safeAddPaise(dividendsReceivedPaise, interestEarnedPaise),
             isRecurringMonthly = category == InvestmentCategory.RECURRING_DEPOSIT || category == InvestmentCategory.SIP
         )
         val effectiveCurrentValue = growthAnalysis.effectiveCurrentValuePaise
@@ -1022,6 +1212,7 @@ class FinanceVaultRepository(
 
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
+            requireAccountInMode(paymentAccountId, isDemo, "Investment payment")
 
             val invId = dao.insertInvestment(
                 InvestmentEntity(
@@ -1201,10 +1392,17 @@ class FinanceVaultRepository(
         updatedCompounding: CompoundingFrequency? = null,
         updatedDurationMonths: Int? = null,
         updatedDividendsPaise: Long? = null,
-        updatedInterestPaise: Long? = null
+        updatedInterestPaise: Long? = null,
+        expectedIsDemo: Boolean? = null
     ) {
+        newRecordedValuePaise?.let { require(it >= 0L) { "Recorded investment value cannot be negative." } }
         database.withTransaction {
             val existing = dao.getInvestmentById(investmentId) ?: return@withTransaction
+            if (expectedIsDemo != null) {
+                require(existing.isDemo == expectedIsDemo) {
+                    "Cross-mode reference violation: cannot update valuation of '${existing.name}' across Demo/Real boundaries."
+                }
+            }
             val units = updatedUnits ?: existing.units
             val buyPrice = updatedBuyPricePerUnitPaise ?: existing.purchasePricePerUnitPaise
             val rate = updatedAnnualRatePercent ?: existing.annualInterestRatePercent
@@ -1226,7 +1424,7 @@ class FinanceVaultRepository(
                 durationMonths = dur,
                 holdingDays = holdingDays,
                 chargesPaise = existing.chargesPaise,
-                dividendsAndInterestPaise = div + intr,
+                dividendsAndInterestPaise = AccountingEngine.safeAddPaise(div, intr),
                 isRecurringMonthly = existing.category == InvestmentCategory.RECURRING_DEPOSIT || existing.category == InvestmentCategory.SIP
             )
             val targetVal = newRecordedValuePaise ?: analysis.effectiveCurrentValuePaise
@@ -1281,6 +1479,7 @@ class FinanceVaultRepository(
     ): Long {
         require(name.isNotBlank()) { "Loan name is required." }
         require(principalPaise > 0L) { "Loan principal must be greater than ₹0." }
+        require(annualInterestRatePercent >= 0.0) { "Loan interest rate cannot be negative." }
         require(tenureMonths > 0) { "Loan tenure must be at least 1 month." }
 
         val calc = FinancialCalculators.calculateLoanAmortization(
@@ -1291,6 +1490,7 @@ class FinanceVaultRepository(
 
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
+            requireAccountInMode(disbursedToAccountId, isDemo, "Loan disbursement")
 
             val loanId = dao.insertLoan(
                 LoanEntity(
@@ -1388,9 +1588,13 @@ class FinanceVaultRepository(
     ): Long {
         require(brand.isNotBlank()) { "Gift card brand is required." }
         require(initialValuePaise > 0L) { "Initial gift card value must be > ₹0." }
+        require(remainingValuePaise in 0L..initialValuePaise) {
+            "Remaining gift card value ($remainingValuePaise paise) must be between ₹0 and initial value ($initialValuePaise paise)."
+        }
 
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
+            requireAccountInMode(purchasedFromAccountId, isDemo, "Gift card purchase")
 
             val gcId = dao.insertGiftCard(
                 GiftCardEntity(
@@ -1479,6 +1683,7 @@ class FinanceVaultRepository(
         notes: String = "",
         isDemo: Boolean = false
     ): Long {
+        require(limitPaise > 0L) { "Budget limit must be greater than ₹0." }
         return database.withTransaction {
             val existingBudgets = dao.getBudgets(isDemo)
             val existingMatch = if (category.equals("OVERALL", ignoreCase = true)) {
@@ -1515,8 +1720,12 @@ class FinanceVaultRepository(
         }
     }
 
-    suspend fun deleteBudget(id: Long) {
-        dao.deleteBudgetById(id)
+    suspend fun deleteBudget(id: Long, expectedIsDemo: Boolean? = null) {
+        if (expectedIsDemo != null) {
+            dao.deleteBudgetByIdAndMode(id, expectedIsDemo)
+        } else {
+            dao.deleteBudgetById(id)
+        }
     }
 
     suspend fun addGoal(
@@ -1529,47 +1738,67 @@ class FinanceVaultRepository(
         notes: String = "",
         isDemo: Boolean = false
     ): Long {
-        val id = dao.insertGoal(
-            GoalEntity(
-                name = name.trim(),
-                goalType = goalType,
-                targetAmountPaise = targetAmountPaise,
-                currentSavedPaise = currentSavedPaise,
-                targetDateEpochDay = targetDateEpochDay,
-                linkedAccountId = linkedAccountId,
-                notes = notes.trim(),
-                isDemo = isDemo
+        require(name.isNotBlank()) { "Goal name is required." }
+        require(targetAmountPaise > 0L) { "Goal target amount must be greater than ₹0." }
+        require(currentSavedPaise >= 0L) { "Current saved amount cannot be negative." }
+        return database.withTransaction {
+            requireAccountInMode(linkedAccountId, isDemo, "Goal linked")
+            val id = dao.insertGoal(
+                GoalEntity(
+                    name = name.trim(),
+                    goalType = goalType,
+                    targetAmountPaise = targetAmountPaise,
+                    currentSavedPaise = currentSavedPaise,
+                    targetDateEpochDay = targetDateEpochDay,
+                    linkedAccountId = linkedAccountId,
+                    notes = notes.trim(),
+                    isDemo = isDemo
+                )
             )
-        )
-        if (currentSavedPaise > 0L) {
+            if (currentSavedPaise > 0L) {
+                dao.insertAuditLog(
+                    AuditLogEntity(
+                        action = "GOAL_CONTRIBUTION",
+                        entityType = "Goal",
+                        entityId = id,
+                        summary = "Saved ${InrMoney.formatPaise(currentSavedPaise)} toward '${name.trim()}'",
+                        isDemo = isDemo
+                    )
+                )
+            }
+            id
+        }
+    }
+
+    suspend fun contributeToGoal(goalId: Long, additionalAmountPaise: Long, expectedIsDemo: Boolean? = null) {
+        require(additionalAmountPaise > 0L) { "Goal contribution amount must be greater than ₹0." }
+        database.withTransaction {
+            val existing = dao.getGoalById(goalId) ?: return@withTransaction
+            if (expectedIsDemo != null) {
+                require(existing.isDemo == expectedIsDemo) {
+                    "Cross-mode reference violation: cannot contribute to '${existing.name}' across Demo/Real boundaries."
+                }
+            }
+            dao.updateGoal(existing.copy(currentSavedPaise = AccountingEngine.safeAddPaise(existing.currentSavedPaise, additionalAmountPaise)))
             dao.insertAuditLog(
                 AuditLogEntity(
                     action = "GOAL_CONTRIBUTION",
                     entityType = "Goal",
-                    entityId = id,
-                    summary = "Saved ${InrMoney.formatPaise(currentSavedPaise)} toward '${name.trim()}'",
-                    isDemo = isDemo
+                    entityId = goalId,
+                    summary = "Contributed ${InrMoney.formatPaise(additionalAmountPaise)} to '${existing.name}'",
+                    isDemo = existing.isDemo
                 )
             )
         }
-        return id
     }
 
-    suspend fun contributeToGoal(goalId: Long, additionalAmountPaise: Long) {
-        val existing = dao.getGoalById(goalId) ?: return
-        dao.updateGoal(existing.copy(currentSavedPaise = existing.currentSavedPaise + additionalAmountPaise))
-        dao.insertAuditLog(
-            AuditLogEntity(
-                action = "GOAL_CONTRIBUTION",
-                entityType = "Goal",
-                entityId = goalId,
-                summary = "Contributed ${InrMoney.formatPaise(additionalAmountPaise)} to '${existing.name}'",
-                isDemo = existing.isDemo
-            )
-        )
+    suspend fun deleteGoal(id: Long, expectedIsDemo: Boolean? = null) {
+        if (expectedIsDemo != null) {
+            dao.deleteGoalByIdAndMode(id, expectedIsDemo)
+        } else {
+            dao.deleteGoalById(id)
+        }
     }
-
-    suspend fun deleteGoal(id: Long) = dao.deleteGoalById(id)
 
     suspend fun addSubscription(
         name: String,
@@ -1584,21 +1813,26 @@ class FinanceVaultRepository(
         customIntervalCount: Int = 1,
         customIntervalUnit: String = "MONTHS"
     ): Long {
-        return dao.insertSubscription(
-            SubscriptionEntity(
-                name = name.trim(),
-                costPaise = costPaise,
-                billingFrequency = billingFrequency,
-                nextRenewalEpochDay = nextRenewalEpochDay,
-                paymentAccountId = paymentAccountId,
-                startDateEpochDay = startDateEpochDay,
-                endDateEpochDay = endDateEpochDay,
-                notes = notes.trim(),
-                isDemo = isDemo,
-                customIntervalCount = customIntervalCount.coerceAtLeast(1),
-                customIntervalUnit = customIntervalUnit.uppercase()
+        require(name.isNotBlank()) { "Subscription name is required." }
+        require(costPaise > 0L) { "Subscription cost must be greater than ₹0." }
+        return database.withTransaction {
+            requireAccountInMode(paymentAccountId, isDemo, "Subscription payment")
+            dao.insertSubscription(
+                SubscriptionEntity(
+                    name = name.trim(),
+                    costPaise = costPaise,
+                    billingFrequency = billingFrequency,
+                    nextRenewalEpochDay = nextRenewalEpochDay,
+                    paymentAccountId = paymentAccountId,
+                    startDateEpochDay = startDateEpochDay,
+                    endDateEpochDay = endDateEpochDay,
+                    notes = notes.trim(),
+                    isDemo = isDemo,
+                    customIntervalCount = customIntervalCount.coerceAtLeast(1),
+                    customIntervalUnit = customIntervalUnit.uppercase()
+                )
             )
-        )
+        }
     }
 
     suspend fun updateSubscriptionRenewalSchedule(
@@ -1606,9 +1840,15 @@ class FinanceVaultRepository(
         nextRenewalEpochDay: Long,
         billingFrequency: BillingFrequency,
         customIntervalCount: Int = 1,
-        customIntervalUnit: String = "MONTHS"
+        customIntervalUnit: String = "MONTHS",
+        expectedIsDemo: Boolean? = null
     ) {
         val sub = dao.getSubscriptionById(subscriptionId) ?: return
+        if (expectedIsDemo != null) {
+            require(sub.isDemo == expectedIsDemo) {
+                "Cross-mode reference violation: cannot modify subscription '${sub.name}' across Demo/Real boundaries."
+            }
+        }
         dao.updateSubscription(
             sub.copy(
                 nextRenewalEpochDay = nextRenewalEpochDay,
@@ -1626,9 +1866,16 @@ class FinanceVaultRepository(
     suspend fun recordSubscriptionPaymentNow(
         subscriptionId: Long,
         sourceAccountId: Long,
-        nextCustomRenewalEpochDay: Long? = null
+        nextCustomRenewalEpochDay: Long? = null,
+        expectedIsDemo: Boolean? = null
     ): Long {
         val sub = requireNotNull(dao.getSubscriptionById(subscriptionId)) { "Subscription not found." }
+        if (expectedIsDemo != null) {
+            require(sub.isDemo == expectedIsDemo) {
+                "Cross-mode reference violation: Subscription '${sub.name}' does not belong to the active mode."
+            }
+        }
+        requireAccountInMode(sourceAccountId, sub.isDemo, "Subscription payment")
         val today = IndianFinancialYear.todayEpochDay()
         val baseEpochDay = maxOf(sub.nextRenewalEpochDay, today)
         val computedNextRenewal = nextCustomRenewalEpochDay ?: IndianFinancialYear.advanceSubscriptionRenewalEpochDay(
@@ -1690,10 +1937,16 @@ class FinanceVaultRepository(
             notes = "Auto-created for hands-free voice transactions",
             isDemo = isDemo
         )
-        return requireNotNull(dao.getAccountById(createdId))
+        return requireNotNull(dao.getAccountByIdAndMode(createdId, isDemo))
     }
 
-    suspend fun deleteSubscription(id: Long) = dao.deleteSubscriptionById(id)
+    suspend fun deleteSubscription(id: Long, expectedIsDemo: Boolean? = null) {
+        if (expectedIsDemo != null) {
+            dao.deleteSubscriptionByIdAndMode(id, expectedIsDemo)
+        } else {
+            dao.deleteSubscriptionById(id)
+        }
+    }
 
     /**
      * Adds a tax payment record and optionally posts the payment through the accounting engine
@@ -1711,9 +1964,11 @@ class FinanceVaultRepository(
         notes: String = "",
         isDemo: Boolean = false
     ): Long {
+        require(amountPaidPaise > 0L) { "Tax amount paid must be greater than ₹0." }
         val ay = IndianFinancialYear.getAssessmentYearForFy(financialYear)
         val displayLabel = supportingDocLabel.trim().ifBlank { taxType.displayName }
         return database.withTransaction {
+            requireAccountInMode(paymentAccountId, isDemo, "Tax payment")
             var txId: Long? = null
             if (paymentAccountId != null && amountPaidPaise > 0L) {
                 txId = recordTransaction(
@@ -1793,6 +2048,16 @@ class FinanceVaultRepository(
         dao.upsertSettings(
             current.copy(
                 isBiometricEnabled = enabled,
+                updatedAtMillis = System.currentTimeMillis()
+            )
+        )
+    }
+
+    suspend fun setLocationTaggingEnabled(enabled: Boolean) {
+        val current = dao.getSettings() ?: AppSettingsEntity()
+        dao.upsertSettings(
+            current.copy(
+                isLocationTaggingEnabled = enabled,
                 updatedAtMillis = System.currentTimeMillis()
             )
         )
@@ -3211,202 +3476,1241 @@ class FinanceVaultRepository(
     }
 
     /**
-     * Exports a complete JSON backup of the user's real records (`isDemo = false`).
-     * Excludes PIN hashes, salts, and raw credentials for safety.
+     * Exports a complete, versioned JSON backup of all real user financial records (`isDemo = false`).
+     *
+     * Security & Integrity Guarantees:
+     * - Never exports PIN hashes, salts, lockout states, or plaintext gift card pins.
+     * - Includes all 14 financial entity tables (`accounts`, `ledger_accounts`, `transactions`,
+     *   `journal_entries`, `journal_lines`, `investments`, `loans`, `loan_payments`, `budgets`,
+     *   `goals`, `gift_cards`, `subscriptions`, `taxes`, `audit_logs`) and safe non-secret settings.
+     * - Embeds a deterministic SHA-256 integrity digest (`payloadSha256`) over all exported arrays.
+     * - If `password` is provided, encrypts the entire JSON backup using AES-256-GCM (derived via
+     *   PBKDF2-HMAC-SHA256, 120,000 iterations).
      */
-    suspend fun createJsonBackupString(): String {
+    suspend fun createJsonBackupString(password: String? = null): String {
         val settings = dao.getSettings() ?: AppSettingsEntity()
         val accounts = dao.getAccounts(isDemo = false)
+        val ledgerAccounts = dao.getLedgerAccounts(isDemo = false)
         val transactions = dao.getTransactions(isDemo = false)
+        val journalEntries = dao.getJournalEntries(isDemo = false)
+        val journalLines = dao.getJournalLines(isDemo = false)
         val investments = dao.getInvestments(isDemo = false)
         val loans = dao.getLoans(isDemo = false)
+        val loanPayments = dao.getLoanPayments(isDemo = false)
         val budgets = dao.getBudgets(isDemo = false)
         val goals = dao.getGoals(isDemo = false)
+        val giftCards = dao.getGiftCards(isDemo = false)
         val subscriptions = dao.getSubscriptions(isDemo = false)
+        val taxes = dao.getTaxRecords(isDemo = false)
+        val auditLogs = dao.getAuditLogs(isDemo = false)
 
         val accountNameById = accounts.associate { it.id to it.name }
 
+        val accountsJson = JSONArray().apply {
+            accounts.forEach { acc ->
+                put(JSONObject().apply {
+                    put("id", acc.id)
+                    put("name", acc.name)
+                    put("accountType", acc.accountType.name)
+                    put("bankName", acc.bankName)
+                    put("branchName", acc.branchName)
+                    put("accountNumber", acc.accountNumber)
+                    put("ifscCode", acc.ifscCode)
+                    put("accountHolder", acc.accountHolder)
+                    put("upiId", acc.upiId)
+                    put("openingBalancePaise", acc.openingBalancePaise)
+                    put("isOpeningBalanceRecorded", acc.isOpeningBalanceRecorded)
+                    put("openingDateEpochDay", acc.openingDateEpochDay)
+                    acc.creditLimitPaise?.let { put("creditLimitPaise", it) }
+                    acc.billingDayOfMonth?.let { put("billingDayOfMonth", it) }
+                    put("notes", acc.notes)
+                    put("isArchived", acc.isArchived)
+                    put("createdAtMillis", acc.createdAtMillis)
+                })
+            }
+        }
+
+        val ledgerAccountsJson = JSONArray().apply {
+            ledgerAccounts.forEach { l ->
+                put(JSONObject().apply {
+                    put("id", l.id)
+                    put("code", l.code)
+                    put("name", l.name)
+                    put("classification", l.classification.name)
+                    put("normalBalance", l.normalBalance.name)
+                    l.linkedUserAccountId?.let { put("linkedUserAccountId", it) }
+                    l.linkedInvestmentId?.let { put("linkedInvestmentId", it) }
+                    l.linkedLoanId?.let { put("linkedLoanId", it) }
+                    l.linkedGiftCardId?.let { put("linkedGiftCardId", it) }
+                    put("isSystemAccount", l.isSystemAccount)
+                })
+            }
+        }
+
+        val investmentsJson = JSONArray().apply {
+            investments.forEach { inv ->
+                put(JSONObject().apply {
+                    put("id", inv.id)
+                    put("name", inv.name)
+                    put("category", inv.category.name)
+                    put("purchaseDateEpochDay", inv.purchaseDateEpochDay)
+                    put("quantity", inv.quantity)
+                    put("units", inv.units)
+                    put("purchasePricePerUnitPaise", inv.purchasePricePerUnitPaise)
+                    put("investedAmountPaise", inv.investedAmountPaise)
+                    put("chargesPaise", inv.chargesPaise)
+                    inv.currentRecordedValuePaise?.let { put("currentRecordedValuePaise", it) }
+                    put("isCurrentValueRecorded", inv.isCurrentValueRecorded)
+                    put("realizedProfitLossPaise", inv.realizedProfitLossPaise)
+                    put("interestEarnedPaise", inv.interestEarnedPaise)
+                    put("dividendsReceivedPaise", inv.dividendsReceivedPaise)
+                    inv.linkedPaymentAccountId?.let { put("linkedPaymentAccountId", it) }
+                    inv.maturityDateEpochDay?.let { put("maturityDateEpochDay", it) }
+                    inv.annualInterestRatePercent?.let { put("annualInterestRatePercent", it) }
+                    put("compoundingFrequency", inv.compoundingFrequency.name)
+                    inv.durationMonths?.let { put("durationMonths", it) }
+                    put("notes", inv.notes)
+                    put("isFullyRedeemed", inv.isFullyRedeemed)
+                    put("createdAtMillis", inv.createdAtMillis)
+                })
+            }
+        }
+
+        val loansJson = JSONArray().apply {
+            loans.forEach { loan ->
+                put(JSONObject().apply {
+                    put("id", loan.id)
+                    put("name", loan.name)
+                    put("loanType", loan.loanType.name)
+                    put("lenderName", loan.lenderName)
+                    put("principalPaise", loan.principalPaise)
+                    put("remainingPrincipalPaise", loan.remainingPrincipalPaise)
+                    put("annualInterestRatePercent", loan.annualInterestRatePercent)
+                    put("tenureMonths", loan.tenureMonths)
+                    put("remainingInstallments", loan.remainingInstallments)
+                    put("startDateEpochDay", loan.startDateEpochDay)
+                    put("emiAmountPaise", loan.emiAmountPaise)
+                    put("totalInterestPaidPaise", loan.totalInterestPaidPaise)
+                    loan.linkedBankAccountId?.let { put("linkedBankAccountId", it) }
+                    put("notes", loan.notes)
+                    put("isClosed", loan.isClosed)
+                    put("createdAtMillis", loan.createdAtMillis)
+                })
+            }
+        }
+
+        val loanPaymentsJson = JSONArray().apply {
+            loanPayments.forEach { lp ->
+                put(JSONObject().apply {
+                    put("id", lp.id)
+                    put("loanId", lp.loanId)
+                    put("transactionId", lp.transactionId)
+                    put("dateEpochDay", lp.dateEpochDay)
+                    put("totalPaymentPaise", lp.totalPaymentPaise)
+                    put("principalComponentPaise", lp.principalComponentPaise)
+                    put("interestComponentPaise", lp.interestComponentPaise)
+                    put("remainingPrincipalAfterPaise", lp.remainingPrincipalAfterPaise)
+                })
+            }
+        }
+
+        val giftCardsJson = JSONArray().apply {
+            giftCards.forEach { gc ->
+                put(JSONObject().apply {
+                    put("id", gc.id)
+                    put("brand", gc.brand)
+                    put("name", gc.name)
+                    put("initialValuePaise", gc.initialValuePaise)
+                    put("remainingValuePaise", gc.remainingValuePaise)
+                    put("purchaseDateEpochDay", gc.purchaseDateEpochDay)
+                    gc.expirationDateEpochDay?.let { put("expirationDateEpochDay", it) }
+                    put("cardNumberMasked", PinSecurityUtil.maskAccountNumber(gc.cardNumberMasked))
+                    put("redemptionCodeProtected", "Protected")
+                    put("notes", gc.notes)
+                    put("createdAtMillis", gc.createdAtMillis)
+                })
+            }
+        }
+
+        val budgetsJson = JSONArray().apply {
+            budgets.forEach { b ->
+                put(JSONObject().apply {
+                    put("id", b.id)
+                    put("name", b.name)
+                    put("budgetPeriod", b.budgetPeriod.name)
+                    put("category", b.category)
+                    put("limitPaise", b.limitPaise)
+                    put("financialYear", b.financialYear)
+                    put("notes", b.notes)
+                    put("createdAtMillis", b.createdAtMillis)
+                })
+            }
+        }
+
+        val goalsJson = JSONArray().apply {
+            goals.forEach { g ->
+                put(JSONObject().apply {
+                    put("id", g.id)
+                    put("name", g.name)
+                    put("goalType", g.goalType.name)
+                    put("targetAmountPaise", g.targetAmountPaise)
+                    put("currentSavedPaise", g.currentSavedPaise)
+                    g.targetDateEpochDay?.let { put("targetDateEpochDay", it) }
+                    g.linkedAccountId?.let { put("linkedAccountId", it) }
+                    put("notes", g.notes)
+                    put("createdAtMillis", g.createdAtMillis)
+                })
+            }
+        }
+
+        val subscriptionsJson = JSONArray().apply {
+            subscriptions.forEach { s ->
+                put(JSONObject().apply {
+                    put("id", s.id)
+                    put("name", s.name)
+                    put("costPaise", s.costPaise)
+                    put("billingFrequency", s.billingFrequency.name)
+                    put("nextRenewalEpochDay", s.nextRenewalEpochDay)
+                    s.paymentAccountId?.let { put("paymentAccountId", it) }
+                    put("startDateEpochDay", s.startDateEpochDay)
+                    s.endDateEpochDay?.let { put("endDateEpochDay", it) }
+                    put("notes", s.notes)
+                    put("isActive", s.isActive)
+                    put("customIntervalCount", s.customIntervalCount)
+                    put("customIntervalUnit", s.customIntervalUnit)
+                    put("createdAtMillis", s.createdAtMillis)
+                })
+            }
+        }
+
+        val taxesJson = JSONArray().apply {
+            taxes.forEach { t ->
+                put(JSONObject().apply {
+                    put("id", t.id)
+                    put("taxType", t.taxType.name)
+                    put("financialYear", t.financialYear)
+                    put("assessmentYear", t.assessmentYear)
+                    put("amountPaidPaise", t.amountPaidPaise)
+                    t.dueDateEpochDay?.let { put("dueDateEpochDay", it) }
+                    put("paymentDateEpochDay", t.paymentDateEpochDay)
+                    put("challanNumber", t.challanNumber)
+                    t.paymentAccountId?.let { put("paymentAccountId", it) }
+                    t.linkedTransactionId?.let { put("linkedTransactionId", it) }
+                    put("supportingDocLabel", t.supportingDocLabel)
+                    put("notes", t.notes)
+                    put("createdAtMillis", t.createdAtMillis)
+                })
+            }
+        }
+
+        val transactionsJson = JSONArray().apply {
+            transactions.forEach { tx ->
+                put(JSONObject().apply {
+                    put("id", tx.id)
+                    put("voucherNumber", tx.voucherNumber)
+                    put("transactionType", tx.transactionType.name)
+                    put("dateEpochDay", tx.dateEpochDay)
+                    put("amountPaise", tx.amountPaise)
+                    put("principalComponentPaise", tx.principalComponentPaise)
+                    put("interestComponentPaise", tx.interestComponentPaise)
+                    put("chargesPaise", tx.chargesPaise)
+                    put("costBasisDisposedPaise", tx.costBasisDisposedPaise)
+                    tx.sourceAccountId?.let { id ->
+                        put("sourceAccountId", id)
+                        accountNameById[id]?.let { put("sourceAccountName", it) }
+                    }
+                    tx.destinationAccountId?.let { id ->
+                        put("destinationAccountId", id)
+                        accountNameById[id]?.let { put("destinationAccountName", it) }
+                    }
+                    put("category", tx.category)
+                    put("description", tx.description)
+                    put("referenceNumber", tx.referenceNumber)
+                    put("notes", tx.notes)
+                    put("locationName", tx.locationName)
+                    tx.latitude?.let { put("latitude", it) }
+                    tx.longitude?.let { put("longitude", it) }
+                    put("attachmentName", tx.attachmentName)
+                    tx.linkedInvestmentId?.let { put("linkedInvestmentId", it) }
+                    tx.linkedLoanId?.let { put("linkedLoanId", it) }
+                    tx.linkedGiftCardId?.let { put("linkedGiftCardId", it) }
+                    tx.linkedTaxRecordId?.let { put("linkedTaxRecordId", it) }
+                    tx.linkedOriginalTransactionId?.let { put("linkedOriginalTransactionId", it) }
+                    put("isReversed", tx.isReversed)
+                    put("createdAtMillis", tx.createdAtMillis)
+                })
+            }
+        }
+
+        val journalEntriesJson = JSONArray().apply {
+            journalEntries.forEach { je ->
+                put(JSONObject().apply {
+                    put("id", je.id)
+                    put("transactionId", je.transactionId)
+                    put("voucherNumber", je.voucherNumber)
+                    put("dateEpochDay", je.dateEpochDay)
+                    put("narration", je.narration)
+                    put("financialYear", je.financialYear)
+                    put("postingStatus", je.postingStatus.name)
+                    put("isReversal", je.isReversal)
+                    je.reversedJournalEntryId?.let { put("reversedJournalEntryId", it) }
+                    put("createdAtMillis", je.createdAtMillis)
+                })
+            }
+        }
+
+        val journalLinesJson = JSONArray().apply {
+            journalLines.forEach { jl ->
+                put(JSONObject().apply {
+                    put("id", jl.id)
+                    put("journalEntryId", jl.journalEntryId)
+                    put("transactionId", jl.transactionId)
+                    put("voucherNumber", jl.voucherNumber)
+                    put("dateEpochDay", jl.dateEpochDay)
+                    put("ledgerAccountId", jl.ledgerAccountId)
+                    put("ledgerAccountName", jl.ledgerAccountName)
+                    put("ledgerFolio", jl.ledgerFolio)
+                    put("debitPaise", jl.debitPaise)
+                    put("creditPaise", jl.creditPaise)
+                    put("lineNarration", jl.lineNarration)
+                })
+            }
+        }
+
+        val auditLogsJson = JSONArray().apply {
+            auditLogs.forEach { log ->
+                put(JSONObject().apply {
+                    put("id", log.id)
+                    put("timestampMillis", log.timestampMillis)
+                    put("action", log.action)
+                    put("entityType", log.entityType)
+                    put("entityId", log.entityId)
+                    put("summary", log.summary)
+                })
+            }
+        }
+
+        val settingsJson = JSONObject().apply {
+            put("userName", settings.userName)
+            put("panMasked", PinSecurityUtil.maskAccountNumber(settings.panMasked))
+            put("activeFinancialYear", settings.activeFinancialYear)
+            put("isPrivacyModeEnabled", settings.isPrivacyModeEnabled)
+            put("themeMode", settings.themeMode.name)
+            put("autoLockMinutes", settings.autoLockMinutes)
+            put("customCategoriesJson", settings.customCategoriesJson)
+            put("isAiFinancialContextConsentGranted", settings.isAiFinancialContextConsentGranted)
+            put("isLocationTaggingEnabled", settings.isLocationTaggingEnabled)
+        }
+
+        val canonicalDigestInput = buildString {
+            append(accountsJson.toString())
+            append("|").append(ledgerAccountsJson.toString())
+            append("|").append(transactionsJson.toString())
+            append("|").append(journalEntriesJson.toString())
+            append("|").append(journalLinesJson.toString())
+            append("|").append(investmentsJson.toString())
+            append("|").append(loansJson.toString())
+            append("|").append(loanPaymentsJson.toString())
+            append("|").append(budgetsJson.toString())
+            append("|").append(goalsJson.toString())
+            append("|").append(giftCardsJson.toString())
+            append("|").append(subscriptionsJson.toString())
+            append("|").append(taxesJson.toString())
+            append("|").append(auditLogsJson.toString())
+        }
+        val payloadSha256 = BackupPasswordCipher.sha256Hex(canonicalDigestInput)
+
         val root = JSONObject().apply {
             put("app", "Finance Vault")
-            put("schemaVersion", 7)
+            put("schemaVersion", 2)
+            put("encrypted", false)
             put("creators", "Made by Lenin and Shaswat")
             put("currency", "INR")
             put("exportedAtMillis", System.currentTimeMillis())
             put("userName", settings.userName)
             put("activeFinancialYear", settings.activeFinancialYear)
-
-            put("accounts", JSONArray().apply {
-                accounts.forEach { acc ->
-                    put(JSONObject().apply {
-                        put("name", acc.name)
-                        put("accountType", acc.accountType.name)
-                        put("bankName", acc.bankName)
-                        put("openingBalancePaise", acc.openingBalancePaise)
-                        put("isOpeningBalanceRecorded", acc.isOpeningBalanceRecorded)
-                        put("openingDateEpochDay", acc.openingDateEpochDay)
-                        acc.creditLimitPaise?.let { put("creditLimitPaise", it) }
-                    })
-                }
-            })
-
-            put("transactions", JSONArray().apply {
-                transactions.filter { !it.isReversed && it.transactionType != TransactionType.OPENING_BALANCE && it.transactionType != TransactionType.REVERSAL }.forEach { tx ->
-                    put(JSONObject().apply {
-                        put("voucherNumber", tx.voucherNumber)
-                        put("transactionType", tx.transactionType.name)
-                        put("dateEpochDay", tx.dateEpochDay)
-                        put("amountPaise", tx.amountPaise)
-                        put("category", tx.category)
-                        put("description", tx.description)
-                        put("locationName", tx.locationName)
-                        tx.sourceAccountId?.let { id -> accountNameById[id]?.let { put("sourceAccountName", it) } }
-                        tx.destinationAccountId?.let { id -> accountNameById[id]?.let { put("destinationAccountName", it) } }
-                    })
-                }
-            })
-
-            put("budgets", JSONArray().apply {
-                budgets.forEach { b ->
-                    put(JSONObject().apply {
-                        put("name", b.name)
-                        put("budgetPeriod", b.budgetPeriod.name)
-                        put("category", b.category)
-                        put("limitPaise", b.limitPaise)
-                        put("financialYear", b.financialYear)
-                    })
-                }
-            })
-
-            put("goals", JSONArray().apply {
-                goals.forEach { g ->
-                    put(JSONObject().apply {
-                        put("name", g.name)
-                        put("goalType", g.goalType.name)
-                        put("targetAmountPaise", g.targetAmountPaise)
-                        put("currentSavedPaise", g.currentSavedPaise)
-                    })
-                }
-            })
-
-            put("subscriptions", JSONArray().apply {
-                subscriptions.forEach { s ->
-                    put(JSONObject().apply {
-                        put("name", s.name)
-                        put("costPaise", s.costPaise)
-                        put("billingFrequency", s.billingFrequency.name)
-                        put("nextRenewalEpochDay", s.nextRenewalEpochDay)
-                    })
-                }
-            })
-
+            put("payloadSha256", payloadSha256)
+            put("settings", settingsJson)
+            put("accounts", accountsJson)
+            put("ledger_accounts", ledgerAccountsJson)
+            put("transactions", transactionsJson)
+            put("journal_entries", journalEntriesJson)
+            put("journal_lines", journalLinesJson)
+            put("investments", investmentsJson)
+            put("loans", loansJson)
+            put("loan_payments", loanPaymentsJson)
+            put("budgets", budgetsJson)
+            put("goals", goalsJson)
+            put("gift_cards", giftCardsJson)
+            put("subscriptions", subscriptionsJson)
+            put("taxes", taxesJson)
+            put("audit_logs", auditLogsJson)
             put("transactionsCount", transactions.size)
             put("investmentsCount", investments.size)
             put("loansCount", loans.size)
             put("budgetsCount", budgets.size)
             put("goalsCount", goals.size)
         }
-        return root.toString(2)
+
+        val plainFormatted = root.toString(2)
+        return if (!password.isNullOrBlank()) {
+            BackupPasswordCipher.encryptJsonWithPassword(plainFormatted, password.trim()).toString(2)
+        } else {
+            plainFormatted
+        }
+    }
+
+    private fun parseAndValidateBackupJson(rawJson: String, password: String?): Pair<JSONObject, Boolean> {
+        require(rawJson.isNotBlank()) { "Backup JSON string cannot be empty." }
+        val outer = try {
+            JSONObject(rawJson.trim())
+        } catch (e: Exception) {
+            throw IllegalArgumentException("Malformed backup JSON format.", e)
+        }
+
+        val isEncrypted = outer.optBoolean("encrypted", false)
+        val root = if (isEncrypted) {
+            require(!password.isNullOrBlank()) {
+                "This backup is password-encrypted. Please provide the backup password to unlock and preview/restore."
+            }
+            val decryptedStr = BackupPasswordCipher.decryptJsonWithPassword(outer, password.trim())
+            JSONObject(decryptedStr)
+        } else {
+            outer
+        }
+
+        val schemaVersion = root.optInt("schemaVersion", 1)
+        require(schemaVersion in setOf(1, 2, 7)) {
+            "Unsupported backup schemaVersion: $schemaVersion"
+        }
+
+        val expectedSha = root.optString("payloadSha256", "")
+        if (expectedSha.isNotBlank()) {
+            val canonicalDigestInput = buildString {
+                append((root.optJSONArray("accounts") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("ledger_accounts") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("transactions") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("journal_entries") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("journal_lines") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("investments") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("loans") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("loan_payments") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("budgets") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("goals") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("gift_cards") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("subscriptions") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("taxes") ?: JSONArray()).toString())
+                append("|").append((root.optJSONArray("audit_logs") ?: JSONArray()).toString())
+            }
+            val actualSha = BackupPasswordCipher.sha256Hex(canonicalDigestInput)
+            require(
+                MessageDigest.isEqual(
+                    expectedSha.lowercase().toByteArray(Charsets.UTF_8),
+                    actualSha.lowercase().toByteArray(Charsets.UTF_8)
+                )
+            ) {
+                "Backup integrity check failed: SHA-256 checksum mismatch (backup file was modified or corrupted)."
+            }
+        }
+        return root to isEncrypted
     }
 
     /**
-     * Restores user accounts, transactions, budgets, goals, and subscriptions from a JSON backup string
-     * while deduplicating against existing records so repeated restores never create duplicates.
+     * Validates a backup JSON string (decrypting if needed), verifies its SHA-256 checksum,
+     * and returns a complete summary preview of all records before the user commits the restore.
      */
-    suspend fun restoreFromJsonBackup(jsonString: String): Int {
-        val obj = JSONObject(jsonString)
+    fun inspectJsonBackup(rawJson: String, password: String? = null): BackupRestorePreview {
+        val (root, isEncrypted) = parseAndValidateBackupJson(rawJson, password)
+        return BackupRestorePreview(
+            schemaVersion = root.optInt("schemaVersion", 2),
+            exportedAtMillis = root.optLong("exportedAtMillis", 0L),
+            userName = root.optString("userName", ""),
+            activeFinancialYear = root.optString("activeFinancialYear", IndianFinancialYear.currentFyLabel()),
+            isEncrypted = isEncrypted,
+            isChecksumValid = true,
+            accountsCount = root.optJSONArray("accounts")?.length() ?: 0,
+            ledgerAccountsCount = root.optJSONArray("ledger_accounts")?.length() ?: 0,
+            transactionsCount = root.optJSONArray("transactions")?.length() ?: 0,
+            journalEntriesCount = root.optJSONArray("journal_entries")?.length() ?: 0,
+            journalLinesCount = root.optJSONArray("journal_lines")?.length() ?: 0,
+            investmentsCount = root.optJSONArray("investments")?.length() ?: 0,
+            loansCount = root.optJSONArray("loans")?.length() ?: 0,
+            loanPaymentsCount = root.optJSONArray("loan_payments")?.length() ?: 0,
+            budgetsCount = root.optJSONArray("budgets")?.length() ?: 0,
+            goalsCount = root.optJSONArray("goals")?.length() ?: 0,
+            giftCardsCount = root.optJSONArray("gift_cards")?.length() ?: 0,
+            subscriptionsCount = root.optJSONArray("subscriptions")?.length() ?: 0,
+            taxRecordsCount = root.optJSONArray("taxes")?.length() ?: 0,
+            auditLogsCount = root.optJSONArray("audit_logs")?.length() ?: 0
+        )
+    }
+
+    /**
+     * Atomically restores all financial entities, double-entry journal entries/lines, linked records,
+     * and non-secret settings from a validated JSON backup.
+     *
+     * Supports:
+     * - `BackupRestoreMode.REPLACE_EXISTING`: Clears existing real-mode data and restores exact snapshot with full foreign-key remapping.
+     * - `BackupRestoreMode.MERGE_KEEP_EXISTING`: Preserves existing records, skips duplicates, and remaps all foreign keys cleanly.
+     */
+    suspend fun restoreFromJsonBackup(
+        jsonString: String,
+        password: String? = null,
+        mode: BackupRestoreMode = BackupRestoreMode.MERGE_KEEP_EXISTING
+    ): Int {
+        val (obj, _) = parseAndValidateBackupJson(jsonString, password)
+        val converters = com.example.data.local.FinanceTypeConverters()
         var restoredCount = 0
+
         database.withTransaction {
+            if (mode == BackupRestoreMode.REPLACE_EXISTING) {
+                clearAllDataForMode(isDemo = false)
+            } else {
+                ensureSystemChartOfAccounts(isDemo = false)
+            }
+
+            // Restore safe non-secret settings (never overwriting PIN hash/salt)
+            obj.optJSONObject("settings")?.let { sObj ->
+                val current = dao.getSettings() ?: AppSettingsEntity()
+                dao.upsertSettings(
+                    current.copy(
+                        userName = sObj.optString("userName", current.userName),
+                        activeFinancialYear = sObj.optString("activeFinancialYear", current.activeFinancialYear),
+                        isPrivacyModeEnabled = sObj.optBoolean("isPrivacyModeEnabled", current.isPrivacyModeEnabled),
+                        themeMode = converters.toThemeMode(sObj.optString("themeMode", current.themeMode.name)),
+                        autoLockMinutes = sObj.optInt("autoLockMinutes", current.autoLockMinutes).coerceIn(1, 60),
+                        customCategoriesJson = sObj.optString("customCategoriesJson", current.customCategoriesJson),
+                        isAiFinancialContextConsentGranted = sObj.optBoolean("isAiFinancialContextConsentGranted", current.isAiFinancialContextConsentGranted),
+                        isLocationTaggingEnabled = sObj.optBoolean("isLocationTaggingEnabled", current.isLocationTaggingEnabled),
+                        updatedAtMillis = System.currentTimeMillis()
+                    )
+                )
+            }
+
+            val hasFullJournalArrays = obj.optJSONArray("journal_entries") != null &&
+                obj.optJSONArray("journal_lines") != null &&
+                obj.optJSONArray("ledger_accounts") != null
+
+            // Foreign-key remap tables: oldId -> newId
+            val accountIdMap = mutableMapOf<Long, Long>()
             val existingAccountsByName = dao.getAccounts(isDemo = false)
                 .associateBy { it.name.trim().lowercase() }
                 .toMutableMap()
 
+            // 1. Accounts
             val accountsArray = obj.optJSONArray("accounts")
             if (accountsArray != null) {
                 for (i in 0 until accountsArray.length()) {
                     val item = accountsArray.getJSONObject(i)
+                    val oldId = item.optLong("id", -(i + 1).toLong())
                     val name = item.optString("name", "").trim()
-                    if (name.isNotBlank() && !existingAccountsByName.containsKey(name.lowercase())) {
-                        val typeName = item.optString("accountType", AccountType.BANK.name)
-                        val type = runCatching { AccountType.valueOf(typeName) }.getOrDefault(AccountType.BANK)
-                        val newId = createAccount(
-                            name = name,
-                            accountType = type,
-                            bankName = item.optString("bankName", ""),
-                            openingBalancePaise = item.optLong("openingBalancePaise", 0L),
-                            isOpeningBalanceRecorded = item.optBoolean("isOpeningBalanceRecorded", false),
-                            openingDateEpochDay = item.optLong("openingDateEpochDay", IndianFinancialYear.todayEpochDay()),
-                            creditLimitPaise = if (item.has("creditLimitPaise")) item.optLong("creditLimitPaise") else null,
-                            isDemo = false
-                        )
+                    if (name.isBlank()) continue
+
+                    val existing = existingAccountsByName[name.lowercase()]
+                    if (existing != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        accountIdMap[oldId] = existing.id
+                    } else {
+                        val type = converters.toAccountType(item.optString("accountType", AccountType.BANK.name))
+                        val newId = if (hasFullJournalArrays) {
+                            dao.insertAccount(
+                                AccountEntity(
+                                    name = name,
+                                    accountType = type,
+                                    bankName = item.optString("bankName", ""),
+                                    branchName = item.optString("branchName", ""),
+                                    accountNumber = item.optString("accountNumber", ""),
+                                    ifscCode = item.optString("ifscCode", ""),
+                                    accountHolder = item.optString("accountHolder", ""),
+                                    upiId = item.optString("upiId", ""),
+                                    openingBalancePaise = item.optLong("openingBalancePaise", 0L).coerceAtLeast(0L),
+                                    isOpeningBalanceRecorded = item.optBoolean("isOpeningBalanceRecorded", false),
+                                    openingDateEpochDay = item.optLong("openingDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                    creditLimitPaise = if (item.has("creditLimitPaise")) item.optLong("creditLimitPaise") else null,
+                                    billingDayOfMonth = if (item.has("billingDayOfMonth")) item.optInt("billingDayOfMonth") else null,
+                                    notes = item.optString("notes", ""),
+                                    isArchived = item.optBoolean("isArchived", false),
+                                    isDemo = false,
+                                    createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                                )
+                            )
+                        } else {
+                            createAccount(
+                                name = name,
+                                accountType = type,
+                                bankName = item.optString("bankName", ""),
+                                branchName = item.optString("branchName", ""),
+                                accountNumber = item.optString("accountNumber", ""),
+                                ifscCode = item.optString("ifscCode", ""),
+                                accountHolder = item.optString("accountHolder", ""),
+                                upiId = item.optString("upiId", ""),
+                                openingBalancePaise = item.optLong("openingBalancePaise", 0L).coerceAtLeast(0L),
+                                isOpeningBalanceRecorded = item.optBoolean("isOpeningBalanceRecorded", false),
+                                openingDateEpochDay = item.optLong("openingDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                creditLimitPaise = if (item.has("creditLimitPaise")) item.optLong("creditLimitPaise") else null,
+                                billingDayOfMonth = if (item.has("billingDayOfMonth")) item.optInt("billingDayOfMonth") else null,
+                                notes = item.optString("notes", ""),
+                                isDemo = false
+                            )
+                        }
+                        accountIdMap[oldId] = newId
                         dao.getAccountById(newId)?.let { existingAccountsByName[name.lowercase()] = it }
                         restoredCount++
                     }
                 }
             }
 
-            val existingTxSignatures = dao.getTransactions(isDemo = false)
-                .map { "${it.transactionType}|${it.dateEpochDay}|${it.amountPaise}|${it.description.trim().lowercase()}" }
-                .toMutableSet()
+            // 2. Investments
+            val investmentIdMap = mutableMapOf<Long, Long>()
+            val existingInvestmentsBySig = dao.getInvestments(isDemo = false)
+                .associateBy { "${it.name.trim().lowercase()}|${it.category.name}|${it.purchaseDateEpochDay}" }
+                .toMutableMap()
 
-            val txArray = obj.optJSONArray("transactions")
-            if (txArray != null) {
-                for (i in 0 until txArray.length()) {
-                    val item = txArray.getJSONObject(i)
-                    val type = runCatching { TransactionType.valueOf(item.optString("transactionType", "EXPENSE")) }
-                        .getOrDefault(TransactionType.EXPENSE)
-                    val dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay())
-                    val amountPaise = item.optLong("amountPaise", 0L)
-                    val category = item.optString("category", "Other")
-                    val description = item.optString("description", category)
-                    val locationName = item.optString("locationName", "")
-                    val srcName = item.optString("sourceAccountName", "").trim().lowercase()
-                    val dstName = item.optString("destinationAccountName", "").trim().lowercase()
-                    val srcId = existingAccountsByName[srcName]?.id
-                    val dstId = existingAccountsByName[dstName]?.id
+            val investmentsArray = obj.optJSONArray("investments")
+            if (investmentsArray != null) {
+                for (i in 0 until investmentsArray.length()) {
+                    val item = investmentsArray.getJSONObject(i)
+                    val oldId = item.optLong("id", -(i + 1).toLong())
+                    val name = item.optString("name", "").trim()
+                    val cat = converters.toInvestmentCategory(item.optString("category", InvestmentCategory.OTHER.name))
+                    val pDate = item.optLong("purchaseDateEpochDay", IndianFinancialYear.todayEpochDay())
+                    val invested = item.optLong("investedAmountPaise", 0L)
+                    if (name.isBlank() || invested < 0L) continue
 
-                    val sig = "$type|$dateEpochDay|$amountPaise|${description.trim().lowercase()}"
-                    val canPost = when (type) {
-                        TransactionType.INCOME -> dstId != null
-                        TransactionType.EXPENSE, TransactionType.CREDIT_CARD_PURCHASE, TransactionType.BANK_CHARGE, TransactionType.TAX_PAYMENT -> srcId != null
-                        TransactionType.TRANSFER, TransactionType.CASH_DEPOSIT, TransactionType.CASH_WITHDRAWAL, TransactionType.CREDIT_CARD_REPAYMENT -> srcId != null && dstId != null && srcId != dstId
-                        else -> false
-                    }
-                    if (amountPaise > 0L && canPost && !existingTxSignatures.contains(sig)) {
-                        recordTransaction(
-                            transactionType = type,
-                            dateEpochDay = dateEpochDay,
-                            amountPaise = amountPaise,
-                            sourceAccountId = srcId,
-                            destinationAccountId = dstId,
-                            category = category,
-                            description = description,
-                            locationName = locationName,
-                            isDemo = false
-                        )
-                        existingTxSignatures.add(sig)
+                    val sig = "${name.lowercase()}|${cat.name}|$pDate"
+                    val existing = existingInvestmentsBySig[sig]
+                    if (existing != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        investmentIdMap[oldId] = existing.id
+                    } else {
+                        val mappedPayAcc = if (item.has("linkedPaymentAccountId")) accountIdMap[item.optLong("linkedPaymentAccountId")] else null
+                        val newId = if (hasFullJournalArrays) {
+                            dao.insertInvestment(
+                                InvestmentEntity(
+                                    name = name,
+                                    category = cat,
+                                    purchaseDateEpochDay = pDate,
+                                    quantity = item.optDouble("quantity", 1.0),
+                                    units = item.optDouble("units", 1.0),
+                                    purchasePricePerUnitPaise = item.optLong("purchasePricePerUnitPaise", 0L),
+                                    investedAmountPaise = invested,
+                                    chargesPaise = item.optLong("chargesPaise", 0L),
+                                    currentRecordedValuePaise = if (item.has("currentRecordedValuePaise")) item.optLong("currentRecordedValuePaise") else null,
+                                    isCurrentValueRecorded = item.optBoolean("isCurrentValueRecorded", false),
+                                    realizedProfitLossPaise = item.optLong("realizedProfitLossPaise", 0L),
+                                    interestEarnedPaise = item.optLong("interestEarnedPaise", 0L),
+                                    dividendsReceivedPaise = item.optLong("dividendsReceivedPaise", 0L),
+                                    linkedPaymentAccountId = mappedPayAcc,
+                                    maturityDateEpochDay = if (item.has("maturityDateEpochDay")) item.optLong("maturityDateEpochDay") else null,
+                                    annualInterestRatePercent = if (item.has("annualInterestRatePercent")) item.optDouble("annualInterestRatePercent") else null,
+                                    compoundingFrequency = converters.toCompoundingFrequency(item.optString("compoundingFrequency", CompoundingFrequency.QUARTERLY.name)),
+                                    durationMonths = if (item.has("durationMonths")) item.optInt("durationMonths") else null,
+                                    notes = item.optString("notes", ""),
+                                    isFullyRedeemed = item.optBoolean("isFullyRedeemed", false),
+                                    isDemo = false,
+                                    createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                                )
+                            )
+                        } else if (invested > 0L) {
+                            addInvestment(
+                                name = name,
+                                category = cat,
+                                purchaseDateEpochDay = pDate,
+                                quantity = item.optDouble("quantity", 1.0),
+                                units = item.optDouble("units", 1.0),
+                                purchasePricePerUnitPaise = item.optLong("purchasePricePerUnitPaise", 0L),
+                                investedAmountPaise = invested,
+                                chargesPaise = item.optLong("chargesPaise", 0L),
+                                currentRecordedValuePaise = if (item.has("currentRecordedValuePaise")) item.optLong("currentRecordedValuePaise") else null,
+                                isCurrentValueRecorded = item.optBoolean("isCurrentValueRecorded", false),
+                                paymentAccountId = mappedPayAcc,
+                                maturityDateEpochDay = if (item.has("maturityDateEpochDay")) item.optLong("maturityDateEpochDay") else null,
+                                annualInterestRatePercent = if (item.has("annualInterestRatePercent")) item.optDouble("annualInterestRatePercent") else null,
+                                compoundingFrequency = converters.toCompoundingFrequency(item.optString("compoundingFrequency", CompoundingFrequency.QUARTERLY.name)),
+                                durationMonths = if (item.has("durationMonths")) item.optInt("durationMonths") else null,
+                                notes = item.optString("notes", ""),
+                                isDemo = false
+                            )
+                        } else continue
+                        investmentIdMap[oldId] = newId
+                        dao.getInvestmentById(newId)?.let { existingInvestmentsBySig[sig] = it }
                         restoredCount++
                     }
                 }
             }
 
+            // 3. Loans
+            val loanIdMap = mutableMapOf<Long, Long>()
+            val existingLoansBySig = dao.getLoans(isDemo = false)
+                .associateBy { "${it.name.trim().lowercase()}|${it.loanType.name}|${it.principalPaise}" }
+                .toMutableMap()
+
+            val loansArray = obj.optJSONArray("loans")
+            if (loansArray != null) {
+                for (i in 0 until loansArray.length()) {
+                    val item = loansArray.getJSONObject(i)
+                    val oldId = item.optLong("id", -(i + 1).toLong())
+                    val name = item.optString("name", "").trim()
+                    val lType = converters.toLoanType(item.optString("loanType", LoanType.PERSONAL.name))
+                    val prin = item.optLong("principalPaise", 0L)
+                    if (name.isBlank() || prin <= 0L) continue
+
+                    val sig = "${name.lowercase()}|${lType.name}|$prin"
+                    val existing = existingLoansBySig[sig]
+                    if (existing != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        loanIdMap[oldId] = existing.id
+                    } else {
+                        val mappedBank = if (item.has("linkedBankAccountId")) accountIdMap[item.optLong("linkedBankAccountId")] else null
+                        val newId = if (hasFullJournalArrays) {
+                            dao.insertLoan(
+                                LoanEntity(
+                                    name = name,
+                                    loanType = lType,
+                                    lenderName = item.optString("lenderName", ""),
+                                    principalPaise = prin,
+                                    remainingPrincipalPaise = item.optLong("remainingPrincipalPaise", prin),
+                                    annualInterestRatePercent = item.optDouble("annualInterestRatePercent", 8.5),
+                                    tenureMonths = item.optInt("tenureMonths", 12).coerceAtLeast(1),
+                                    remainingInstallments = item.optInt("remainingInstallments", 12).coerceAtLeast(0),
+                                    startDateEpochDay = item.optLong("startDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                    emiAmountPaise = item.optLong("emiAmountPaise", prin / 12),
+                                    totalInterestPaidPaise = item.optLong("totalInterestPaidPaise", 0L),
+                                    linkedBankAccountId = mappedBank,
+                                    notes = item.optString("notes", ""),
+                                    isClosed = item.optBoolean("isClosed", false),
+                                    isDemo = false,
+                                    createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                                )
+                            )
+                        } else {
+                            addLoan(
+                                name = name,
+                                loanType = lType,
+                                lenderName = item.optString("lenderName", ""),
+                                principalPaise = prin,
+                                annualInterestRatePercent = item.optDouble("annualInterestRatePercent", 8.5),
+                                tenureMonths = item.optInt("tenureMonths", 12).coerceAtLeast(1),
+                                startDateEpochDay = item.optLong("startDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                disbursedToAccountId = mappedBank,
+                                notes = item.optString("notes", ""),
+                                isDemo = false
+                            )
+                        }
+                        loanIdMap[oldId] = newId
+                        dao.getLoanById(newId)?.let { existingLoansBySig[sig] = it }
+                        restoredCount++
+                    }
+                }
+            }
+
+            // 4. Gift Cards
+            val giftCardIdMap = mutableMapOf<Long, Long>()
+            val existingGiftCardsBySig = dao.getGiftCards(isDemo = false)
+                .associateBy { "${it.brand.trim().lowercase()}|${it.name.trim().lowercase()}|${it.initialValuePaise}" }
+                .toMutableMap()
+
+            val giftCardsArray = obj.optJSONArray("gift_cards")
+            if (giftCardsArray != null) {
+                for (i in 0 until giftCardsArray.length()) {
+                    val item = giftCardsArray.getJSONObject(i)
+                    val oldId = item.optLong("id", -(i + 1).toLong())
+                    val brand = item.optString("brand", "").trim()
+                    val name = item.optString("name", brand).trim()
+                    val initVal = item.optLong("initialValuePaise", 0L)
+                    if (brand.isBlank() || initVal <= 0L) continue
+
+                    val sig = "${brand.lowercase()}|${name.lowercase()}|$initVal"
+                    val existing = existingGiftCardsBySig[sig]
+                    if (existing != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        giftCardIdMap[oldId] = existing.id
+                    } else {
+                        val remVal = item.optLong("remainingValuePaise", initVal).coerceIn(0L, initVal)
+                        val newId = if (hasFullJournalArrays) {
+                            dao.insertGiftCard(
+                                GiftCardEntity(
+                                    brand = brand,
+                                    name = name,
+                                    initialValuePaise = initVal,
+                                    remainingValuePaise = remVal,
+                                    purchaseDateEpochDay = item.optLong("purchaseDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                    expirationDateEpochDay = if (item.has("expirationDateEpochDay")) item.optLong("expirationDateEpochDay") else null,
+                                    cardNumberMasked = item.optString("cardNumberMasked", "Not provided"),
+                                    redemptionCodeProtected = item.optString("redemptionCodeProtected", "Protected"),
+                                    notes = item.optString("notes", ""),
+                                    isDemo = false,
+                                    createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                                )
+                            )
+                        } else {
+                            addGiftCard(
+                                brand = brand,
+                                name = name,
+                                initialValuePaise = initVal,
+                                remainingValuePaise = remVal,
+                                purchaseDateEpochDay = item.optLong("purchaseDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                                expirationDateEpochDay = if (item.has("expirationDateEpochDay")) item.optLong("expirationDateEpochDay") else null,
+                                notes = item.optString("notes", ""),
+                                isDemo = false
+                            )
+                        }
+                        giftCardIdMap[oldId] = newId
+                        dao.getGiftCardById(newId)?.let { existingGiftCardsBySig[sig] = it }
+                        restoredCount++
+                    }
+                }
+            }
+
+            // 5. Ledger Accounts (Chart of Accounts)
+            val ledgerIdMap = mutableMapOf<Long, Long>()
+            val existingSystemLedgersByClass = dao.getLedgerAccounts(isDemo = false)
+                .filter { it.isSystemAccount }
+                .associateBy { it.classification }
+            val existingLedgersByCode = dao.getLedgerAccounts(isDemo = false)
+                .associateBy { it.code }
+                .toMutableMap()
+
+            val ledgerArray = obj.optJSONArray("ledger_accounts")
+            if (ledgerArray != null && hasFullJournalArrays) {
+                for (i in 0 until ledgerArray.length()) {
+                    val item = ledgerArray.getJSONObject(i)
+                    val oldId = item.optLong("id", -(i + 1).toLong())
+                    val classification = converters.toLedgerClassification(item.optString("classification", LedgerClassification.EXPENSE_OTHER.name))
+                    val isSys = item.optBoolean("isSystemAccount", false)
+                    if (isSys) {
+                        val sysMatch = existingSystemLedgersByClass[classification]
+                        if (sysMatch != null) {
+                            ledgerIdMap[oldId] = sysMatch.id
+                            continue
+                        }
+                    }
+
+                    val mappedUserAcc = if (item.has("linkedUserAccountId")) accountIdMap[item.optLong("linkedUserAccountId")] else null
+                    val mappedInv = if (item.has("linkedInvestmentId")) investmentIdMap[item.optLong("linkedInvestmentId")] else null
+                    val mappedLoan = if (item.has("linkedLoanId")) loanIdMap[item.optLong("linkedLoanId")] else null
+                    val mappedGc = if (item.has("linkedGiftCardId")) giftCardIdMap[item.optLong("linkedGiftCardId")] else null
+
+                    val existingLinked = when {
+                        mappedUserAcc != null -> dao.getLedgerByUserAccountId(mappedUserAcc, isDemo = false)
+                        mappedInv != null -> dao.getLedgerByInvestmentId(mappedInv, isDemo = false)
+                        mappedLoan != null -> dao.getLedgerByLoanId(mappedLoan, isDemo = false)
+                        mappedGc != null -> dao.getLedgerByGiftCardId(mappedGc, isDemo = false)
+                        else -> existingLedgersByCode[item.optString("code", "")]
+                    }
+
+                    if (existingLinked != null) {
+                        ledgerIdMap[oldId] = existingLinked.id
+                    } else {
+                        val newId = dao.insertLedgerAccount(
+                            LedgerAccountEntity(
+                                code = item.optString("code", "1999"),
+                                name = item.optString("name", "Ledger Account"),
+                                classification = classification,
+                                normalBalance = converters.toNormalBalance(item.optString("normalBalance", classification.normalBalance.name)),
+                                linkedUserAccountId = mappedUserAcc,
+                                linkedInvestmentId = mappedInv,
+                                linkedLoanId = mappedLoan,
+                                linkedGiftCardId = mappedGc,
+                                isSystemAccount = isSys,
+                                isDemo = false
+                            )
+                        )
+                        ledgerIdMap[oldId] = newId
+                    }
+                }
+            } else {
+                // Ensure every restored account, investment, loan, and gift card has a ledger account mapped
+                for ((_, newAccId) in accountIdMap) {
+                    if (dao.getLedgerByUserAccountId(newAccId, isDemo = false) == null) {
+                        val acc = dao.getAccountById(newAccId) ?: continue
+                        val prefix = if (acc.accountType == AccountType.CREDIT_CARD) "21" else "11"
+                        dao.insertLedgerAccount(
+                            LedgerAccountEntity(
+                                code = "$prefix${newAccId.toString().padStart(3, '0')}",
+                                name = acc.name,
+                                classification = acc.accountType.ledgerClassification,
+                                normalBalance = acc.accountType.normalBalance,
+                                linkedUserAccountId = newAccId,
+                                isSystemAccount = false,
+                                isDemo = false
+                            )
+                        )
+                    }
+                }
+            }
+
+            // 6. Transactions, Journal Entries, and Journal Lines
+            val txIdMap = mutableMapOf<Long, Long>()
+            if (hasFullJournalArrays) {
+                val existingTxBySig = dao.getTransactions(isDemo = false)
+                    .associateBy { "${it.voucherNumber}|${it.dateEpochDay}|${it.amountPaise}|${it.transactionType.name}" }
+                    .toMutableMap()
+
+                val txArray = obj.optJSONArray("transactions") ?: JSONArray()
+                for (i in 0 until txArray.length()) {
+                    val item = txArray.getJSONObject(i)
+                    val oldTxId = item.optLong("id", -(i + 1).toLong())
+                    val voucher = item.optString("voucherNumber", "VCH-RESTORED-$i")
+                    val type = converters.toTransactionType(item.optString("transactionType", "EXPENSE"))
+                    val dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay())
+                    val amountPaise = item.optLong("amountPaise", 0L)
+                    if (amountPaise <= 0L) continue
+
+                    val sig = "$voucher|$dateEpochDay|$amountPaise|${type.name}"
+                    val existingTx = existingTxBySig[sig]
+                    if (existingTx != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        txIdMap[oldTxId] = existingTx.id
+                        continue
+                    }
+
+                    val srcAccId = when {
+                        item.has("sourceAccountId") -> accountIdMap[item.optLong("sourceAccountId")]
+                        item.has("sourceAccountName") -> existingAccountsByName[item.optString("sourceAccountName").trim().lowercase()]?.id
+                        else -> null
+                    }
+                    val dstAccId = when {
+                        item.has("destinationAccountId") -> accountIdMap[item.optLong("destinationAccountId")]
+                        item.has("destinationAccountName") -> existingAccountsByName[item.optString("destinationAccountName").trim().lowercase()]?.id
+                        else -> null
+                    }
+                    val mappedInvId = if (item.has("linkedInvestmentId")) investmentIdMap[item.optLong("linkedInvestmentId")] else null
+                    val mappedLoanId = if (item.has("linkedLoanId")) loanIdMap[item.optLong("linkedLoanId")] else null
+                    val mappedGcId = if (item.has("linkedGiftCardId")) giftCardIdMap[item.optLong("linkedGiftCardId")] else null
+                    val mappedOrigTxId = if (item.has("linkedOriginalTransactionId")) txIdMap[item.optLong("linkedOriginalTransactionId")] else null
+
+                    val newTxId = dao.insertTransaction(
+                        TransactionEntity(
+                            voucherNumber = voucher,
+                            dateEpochDay = dateEpochDay,
+                            amountPaise = amountPaise,
+                            principalComponentPaise = item.optLong("principalComponentPaise", 0L),
+                            interestComponentPaise = item.optLong("interestComponentPaise", 0L),
+                            chargesPaise = item.optLong("chargesPaise", 0L),
+                            costBasisDisposedPaise = item.optLong("costBasisDisposedPaise", 0L),
+                            transactionType = type,
+                            sourceAccountId = srcAccId,
+                            destinationAccountId = dstAccId,
+                            category = item.optString("category", "Other"),
+                            description = item.optString("description", ""),
+                            referenceNumber = item.optString("referenceNumber", ""),
+                            notes = item.optString("notes", ""),
+                            locationName = item.optString("locationName", ""),
+                            latitude = if (item.has("latitude")) item.optDouble("latitude") else null,
+                            longitude = if (item.has("longitude")) item.optDouble("longitude") else null,
+                            attachmentName = item.optString("attachmentName", ""),
+                            linkedInvestmentId = mappedInvId,
+                            linkedLoanId = mappedLoanId,
+                            linkedGiftCardId = mappedGcId,
+                            linkedOriginalTransactionId = mappedOrigTxId,
+                            isReversed = item.optBoolean("isReversed", false),
+                            isDemo = false,
+                            createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                        )
+                    )
+                    txIdMap[oldTxId] = newTxId
+                    dao.getTransactionById(newTxId)?.let { existingTxBySig[sig] = it }
+                    restoredCount++
+                }
+
+                // Restore Journal Entries
+                val journalEntryIdMap = mutableMapOf<Long, Long>()
+                val existingEntryByVoucher = dao.getJournalEntries(isDemo = false)
+                    .associateBy { "${it.voucherNumber}|${it.dateEpochDay}|${it.isReversal}" }
+                    .toMutableMap()
+
+                val jeArray = obj.optJSONArray("journal_entries") ?: JSONArray()
+                for (i in 0 until jeArray.length()) {
+                    val item = jeArray.getJSONObject(i)
+                    val oldJeId = item.optLong("id", -(i + 1).toLong())
+                    val oldTxId = item.optLong("transactionId", 0L)
+                    val mappedTxId = if (oldTxId == 0L) 0L else (txIdMap[oldTxId] ?: continue)
+                    val voucher = item.optString("voucherNumber", "VCH-JE-$i")
+                    val dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay())
+                    val isRev = item.optBoolean("isReversal", false)
+
+                    val jeSig = "$voucher|$dateEpochDay|$isRev"
+                    val existingJe = existingEntryByVoucher[jeSig]
+                    if (existingJe != null && mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                        journalEntryIdMap[oldJeId] = existingJe.id
+                        continue
+                    }
+
+                    val mappedReversedId = if (item.has("reversedJournalEntryId")) journalEntryIdMap[item.optLong("reversedJournalEntryId")] else null
+                    val newJeId = dao.insertJournalEntry(
+                        JournalEntryEntity(
+                            transactionId = mappedTxId,
+                            voucherNumber = voucher,
+                            dateEpochDay = dateEpochDay,
+                            narration = item.optString("narration", ""),
+                            financialYear = item.optString("financialYear", IndianFinancialYear.getFinancialYearLabel(dateEpochDay)),
+                            postingStatus = converters.toPostingStatus(item.optString("postingStatus", PostingStatus.POSTED.name)),
+                            isReversal = isRev,
+                            reversedJournalEntryId = mappedReversedId,
+                            isDemo = false,
+                            createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                        )
+                    )
+                    journalEntryIdMap[oldJeId] = newJeId
+                }
+
+                // Restore Journal Lines
+                val jlArray = obj.optJSONArray("journal_lines") ?: JSONArray()
+                val existingLineEntryIds = if (mode == BackupRestoreMode.MERGE_KEEP_EXISTING) {
+                    dao.getJournalLines(isDemo = false).map { it.journalEntryId }.toSet()
+                } else emptySet()
+                val linesToInsert = mutableListOf<JournalLineEntity>()
+
+                for (i in 0 until jlArray.length()) {
+                    val item = jlArray.getJSONObject(i)
+                    val oldJeId = item.optLong("journalEntryId", 0L)
+                    val mappedJeId = journalEntryIdMap[oldJeId] ?: continue
+                    if (mappedJeId in existingLineEntryIds) continue
+
+                    val oldTxId = item.optLong("transactionId", 0L)
+                    val mappedTxId = if (oldTxId == 0L) 0L else (txIdMap[oldTxId] ?: 0L)
+                    val oldLedgerId = item.optLong("ledgerAccountId", 0L)
+                    val mappedLedgerId = ledgerIdMap[oldLedgerId] ?: continue
+
+                    linesToInsert.add(
+                        JournalLineEntity(
+                            journalEntryId = mappedJeId,
+                            transactionId = mappedTxId,
+                            voucherNumber = item.optString("voucherNumber", ""),
+                            dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay()),
+                            ledgerAccountId = mappedLedgerId,
+                            ledgerAccountName = item.optString("ledgerAccountName", ""),
+                            ledgerFolio = item.optString("ledgerFolio", "LF-$mappedLedgerId"),
+                            debitPaise = item.optLong("debitPaise", 0L),
+                            creditPaise = item.optLong("creditPaise", 0L),
+                            lineNarration = item.optString("lineNarration", ""),
+                            isDemo = false
+                        )
+                    )
+                }
+                if (linesToInsert.isNotEmpty()) {
+                    dao.insertJournalLines(linesToInsert)
+                }
+
+                // Restore Loan Payments
+                val lpArray = obj.optJSONArray("loan_payments") ?: JSONArray()
+                for (i in 0 until lpArray.length()) {
+                    val item = lpArray.getJSONObject(i)
+                    val mappedLoanId = loanIdMap[item.optLong("loanId")] ?: continue
+                    val mappedTxId = txIdMap[item.optLong("transactionId")] ?: 0L
+                    dao.insertLoanPayment(
+                        LoanPaymentEntity(
+                            loanId = mappedLoanId,
+                            transactionId = mappedTxId,
+                            dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay()),
+                            totalPaymentPaise = item.optLong("totalPaymentPaise", 0L),
+                            principalComponentPaise = item.optLong("principalComponentPaise", 0L),
+                            interestComponentPaise = item.optLong("interestComponentPaise", 0L),
+                            remainingPrincipalAfterPaise = item.optLong("remainingPrincipalAfterPaise", 0L),
+                            isDemo = false
+                        )
+                    )
+                }
+            } else {
+                // Legacy v1/v7 backup without raw journal lines: re-post transactions through AccountingEngine
+                val existingTxSignatures = dao.getTransactions(isDemo = false)
+                    .map { "${it.transactionType}|${it.dateEpochDay}|${it.amountPaise}|${it.description.trim().lowercase()}" }
+                    .toMutableSet()
+
+                val txArray = obj.optJSONArray("transactions")
+                if (txArray != null) {
+                    for (i in 0 until txArray.length()) {
+                        val item = txArray.getJSONObject(i)
+                        val type = converters.toTransactionType(item.optString("transactionType", "EXPENSE"))
+                        val dateEpochDay = item.optLong("dateEpochDay", IndianFinancialYear.todayEpochDay())
+                        val amountPaise = item.optLong("amountPaise", 0L)
+                        val category = item.optString("category", "Other")
+                        val description = item.optString("description", category)
+                        val locationName = item.optString("locationName", "")
+                        val srcName = item.optString("sourceAccountName", "").trim().lowercase()
+                        val dstName = item.optString("destinationAccountName", "").trim().lowercase()
+                        val srcId = existingAccountsByName[srcName]?.id
+                        val dstId = existingAccountsByName[dstName]?.id
+
+                        val sig = "$type|$dateEpochDay|$amountPaise|${description.trim().lowercase()}"
+                        val canPost = when (type) {
+                            TransactionType.INCOME -> dstId != null
+                            TransactionType.EXPENSE, TransactionType.CREDIT_CARD_PURCHASE, TransactionType.BANK_CHARGE, TransactionType.TAX_PAYMENT -> srcId != null
+                            TransactionType.TRANSFER, TransactionType.CASH_DEPOSIT, TransactionType.CASH_WITHDRAWAL, TransactionType.CREDIT_CARD_REPAYMENT -> srcId != null && dstId != null && srcId != dstId
+                            else -> false
+                        }
+                        if (amountPaise > 0L && canPost && !existingTxSignatures.contains(sig)) {
+                            recordTransaction(
+                                transactionType = type,
+                                dateEpochDay = dateEpochDay,
+                                amountPaise = amountPaise,
+                                sourceAccountId = srcId,
+                                destinationAccountId = dstId,
+                                category = category,
+                                description = description,
+                                locationName = locationName,
+                                isDemo = false
+                            )
+                            existingTxSignatures.add(sig)
+                            restoredCount++
+                        }
+                    }
+                }
+            }
+
+            // 7. Budgets
             val budgetsArray = obj.optJSONArray("budgets")
             if (budgetsArray != null) {
                 for (i in 0 until budgetsArray.length()) {
                     val item = budgetsArray.getJSONObject(i)
                     val limit = item.optLong("limitPaise", 0L)
                     if (limit > 0L) {
-                        val period = runCatching { BudgetPeriod.valueOf(item.optString("budgetPeriod", "MONTHLY")) }.getOrDefault(BudgetPeriod.MONTHLY)
+                        val period = converters.toBudgetPeriod(item.optString("budgetPeriod", "MONTHLY"))
                         addBudget(
                             name = item.optString("name", "Budget"),
                             budgetPeriod = period,
                             category = item.optString("category", "OVERALL"),
                             limitPaise = limit,
                             financialYear = item.optString("financialYear", IndianFinancialYear.currentFyLabel()),
+                            notes = item.optString("notes", ""),
                             isDemo = false
                         )
                         restoredCount++
                     }
                 }
+            }
+
+            // 8. Goals
+            val existingGoalsByName = dao.getGoals(isDemo = false)
+                .map { it.name.trim().lowercase() }
+                .toMutableSet()
+            val goalsArray = obj.optJSONArray("goals")
+            if (goalsArray != null) {
+                for (i in 0 until goalsArray.length()) {
+                    val item = goalsArray.getJSONObject(i)
+                    val name = item.optString("name", "").trim()
+                    val target = item.optLong("targetAmountPaise", 0L)
+                    if (name.isBlank() || target <= 0L || existingGoalsByName.contains(name.lowercase())) continue
+                    val mappedAcc = if (item.has("linkedAccountId")) accountIdMap[item.optLong("linkedAccountId")] else null
+                    dao.insertGoal(
+                        GoalEntity(
+                            name = name,
+                            goalType = converters.toGoalType(item.optString("goalType", GoalType.SAVINGS.name)),
+                            targetAmountPaise = target,
+                            currentSavedPaise = item.optLong("currentSavedPaise", 0L).coerceAtLeast(0L),
+                            targetDateEpochDay = if (item.has("targetDateEpochDay")) item.optLong("targetDateEpochDay") else null,
+                            linkedAccountId = mappedAcc,
+                            notes = item.optString("notes", ""),
+                            isDemo = false,
+                            createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                        )
+                    )
+                    existingGoalsByName.add(name.lowercase())
+                    restoredCount++
+                }
+            }
+
+            // 9. Subscriptions
+            val existingSubsByName = dao.getSubscriptions(isDemo = false)
+                .map { it.name.trim().lowercase() }
+                .toMutableSet()
+            val subsArray = obj.optJSONArray("subscriptions")
+            if (subsArray != null) {
+                for (i in 0 until subsArray.length()) {
+                    val item = subsArray.getJSONObject(i)
+                    val name = item.optString("name", "").trim()
+                    val cost = item.optLong("costPaise", 0L)
+                    if (name.isBlank() || cost <= 0L || existingSubsByName.contains(name.lowercase())) continue
+                    val mappedAcc = if (item.has("paymentAccountId")) accountIdMap[item.optLong("paymentAccountId")] else null
+                    dao.insertSubscription(
+                        SubscriptionEntity(
+                            name = name,
+                            costPaise = cost,
+                            billingFrequency = converters.toBillingFrequency(item.optString("billingFrequency", BillingFrequency.MONTHLY.name)),
+                            nextRenewalEpochDay = item.optLong("nextRenewalEpochDay", IndianFinancialYear.todayEpochDay() + 30L),
+                            paymentAccountId = mappedAcc,
+                            startDateEpochDay = item.optLong("startDateEpochDay", IndianFinancialYear.todayEpochDay()),
+                            endDateEpochDay = if (item.has("endDateEpochDay")) item.optLong("endDateEpochDay") else null,
+                            notes = item.optString("notes", ""),
+                            isActive = item.optBoolean("isActive", true),
+                            isDemo = false,
+                            createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis()),
+                            customIntervalCount = item.optInt("customIntervalCount", 1).coerceAtLeast(1),
+                            customIntervalUnit = item.optString("customIntervalUnit", "MONTHS")
+                        )
+                    )
+                    existingSubsByName.add(name.lowercase())
+                    restoredCount++
+                }
+            }
+
+            // 10. Tax Records
+            val existingTaxSigs = dao.getTaxRecords(isDemo = false)
+                .map { "${it.taxType.name}|${it.financialYear}|${it.paymentDateEpochDay}|${it.amountPaidPaise}" }
+                .toMutableSet()
+            val taxesArray = obj.optJSONArray("taxes")
+            if (taxesArray != null) {
+                for (i in 0 until taxesArray.length()) {
+                    val item = taxesArray.getJSONObject(i)
+                    val tType = converters.toTaxType(item.optString("taxType", TaxType.INCOME_TAX.name))
+                    val fy = item.optString("financialYear", IndianFinancialYear.currentFyLabel())
+                    val payDate = item.optLong("paymentDateEpochDay", IndianFinancialYear.todayEpochDay())
+                    val amt = item.optLong("amountPaidPaise", 0L)
+                    if (amt <= 0L) continue
+                    val sig = "${tType.name}|$fy|$payDate|$amt"
+                    if (existingTaxSigs.contains(sig)) continue
+
+                    val mappedAcc = if (item.has("paymentAccountId")) accountIdMap[item.optLong("paymentAccountId")] else null
+                    val mappedTx = if (item.has("linkedTransactionId")) txIdMap[item.optLong("linkedTransactionId")] else null
+                    dao.insertTaxRecord(
+                        TaxRecordEntity(
+                            taxType = tType,
+                            financialYear = fy,
+                            assessmentYear = item.optString("assessmentYear", IndianFinancialYear.getAssessmentYearForFy(fy)),
+                            amountPaidPaise = amt,
+                            dueDateEpochDay = if (item.has("dueDateEpochDay")) item.optLong("dueDateEpochDay") else null,
+                            paymentDateEpochDay = payDate,
+                            challanNumber = item.optString("challanNumber", ""),
+                            paymentAccountId = mappedAcc,
+                            linkedTransactionId = mappedTx,
+                            supportingDocLabel = item.optString("supportingDocLabel", tType.displayName),
+                            notes = item.optString("notes", ""),
+                            isDemo = false,
+                            createdAtMillis = item.optLong("createdAtMillis", System.currentTimeMillis())
+                        )
+                    )
+                    existingTaxSigs.add(sig)
+                    restoredCount++
+                }
+            }
+
+            // 11. Audit Logs
+            val existingAuditSigs = dao.getAuditLogs(isDemo = false)
+                .map { "${it.timestampMillis}|${it.action}|${it.summary}" }
+                .toMutableSet()
+            val auditArray = obj.optJSONArray("audit_logs")
+            if (auditArray != null) {
+                for (i in 0 until auditArray.length()) {
+                    val item = auditArray.getJSONObject(i)
+                    val ts = item.optLong("timestampMillis", System.currentTimeMillis())
+                    val act = item.optString("action", "VOUCHER_POSTED")
+                    val sum = item.optString("summary", "")
+                    val sig = "$ts|$act|$sum"
+                    if (sum.isBlank() || existingAuditSigs.contains(sig)) continue
+                    dao.insertAuditLog(
+                        AuditLogEntity(
+                            timestampMillis = ts,
+                            action = act,
+                            entityType = item.optString("entityType", "Transaction"),
+                            entityId = item.optLong("entityId", 0L),
+                            summary = sum,
+                            isDemo = false
+                        )
+                    )
+                    existingAuditSigs.add(sig)
+                }
+            }
+
+            // Final double-entry integrity assertion before committing transaction
+            val allRestoredLines = dao.getJournalLines(isDemo = false)
+            require(AccountingEngine.verifyLedgerIntegrity(allRestoredLines)) {
+                "Restore aborted: restored journal lines failed double-entry balance verification (Debits != Credits)."
             }
         }
         return restoredCount

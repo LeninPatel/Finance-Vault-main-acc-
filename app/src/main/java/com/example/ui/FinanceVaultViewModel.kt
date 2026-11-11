@@ -231,19 +231,23 @@ class FinanceVaultViewModel(
 
     @Immutable
     data class PendingAiTransactionConfirmation(
-        val transactionType: TransactionType,
-        val dateEpochDay: Long,
-        val amountPaise: Long,
-        val sourceAccountId: Long?,
-        val sourceAccountName: String,
-        val destinationAccountId: Long?,
-        val destinationAccountName: String,
-        val category: String,
-        val description: String,
-        val locationName: String,
-        val latitude: Double?,
-        val longitude: Double?,
-        val isDemo: Boolean
+        val transactionType: TransactionType = TransactionType.EXPENSE,
+        val dateEpochDay: Long = IndianFinancialYear.todayEpochDay(),
+        val amountPaise: Long = 0L,
+        val sourceAccountId: Long? = null,
+        val sourceAccountName: String = "",
+        val destinationAccountId: Long? = null,
+        val destinationAccountName: String = "",
+        val category: String = "",
+        val description: String = "",
+        val locationName: String = "",
+        val latitude: Double? = null,
+        val longitude: Double? = null,
+        val isDemo: Boolean = false,
+        val operationType: String = "RECORD_TRANSACTION",
+        val operationTitle: String = "Confirm AI Transaction",
+        val targetTransactionIdToReverse: Long? = null,
+        val customCommitAction: (suspend () -> String)? = null
     )
 
     private val _pendingVoiceDisambiguation = MutableStateFlow<PendingVoiceDisambiguation?>(null)
@@ -252,6 +256,9 @@ class FinanceVaultViewModel(
     private val _pendingAiConfirmation = MutableStateFlow<PendingAiTransactionConfirmation?>(null)
     val pendingAiConfirmation: StateFlow<PendingAiTransactionConfirmation?> = _pendingAiConfirmation.asStateFlow()
 
+    private val _pendingBackupRestorePreview = MutableStateFlow<com.example.data.repository.BackupRestorePreview?>(null)
+    val pendingBackupRestorePreview: StateFlow<com.example.data.repository.BackupRestorePreview?> = _pendingBackupRestorePreview.asStateFlow()
+
     private val _pinLockoutErrorMessage = MutableStateFlow<String?>(null)
     val pinLockoutErrorMessage: StateFlow<String?> = _pinLockoutErrorMessage.asStateFlow()
 
@@ -259,6 +266,8 @@ class FinanceVaultViewModel(
     private var activeVoiceCommandJob: Job? = null
 
     private val _isPinUnlockedSession = MutableStateFlow(false)
+    private val lastUserInteractionMillis = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+    private val backgroundEnteredAtMillis = java.util.concurrent.atomic.AtomicLong(0L)
     private val notifiedBudgetTiers = mutableMapOf<String, Int>()
 
     init {
@@ -624,6 +633,8 @@ class FinanceVaultViewModel(
         }
         if (valid) {
             _pinLockoutErrorMessage.value = null
+            lastUserInteractionMillis.set(System.currentTimeMillis())
+            backgroundEnteredAtMillis.set(0L)
             _isPinUnlockedSession.value = true
         }
         return valid
@@ -639,6 +650,43 @@ class FinanceVaultViewModel(
         if (!s.pinHashSha256.isNullOrBlank() || s.isBiometricEnabled) {
             _isPinUnlockedSession.value = false
         }
+    }
+
+    fun recordUserInteraction(nowMillis: Long = System.currentTimeMillis()) {
+        lastUserInteractionMillis.set(nowMillis)
+    }
+
+    fun onAppBackgrounded(isChangingConfigurations: Boolean, nowMillis: Long = System.currentTimeMillis()) {
+        if (!isChangingConfigurations) {
+            backgroundEnteredAtMillis.set(nowMillis)
+        }
+    }
+
+    fun onAppForegrounded(nowMillis: Long = System.currentTimeMillis()) {
+        val bgAt = backgroundEnteredAtMillis.getAndSet(0L)
+        val s = uiState.value.settings
+        val hasSecurityLock = !s.pinHashSha256.isNullOrBlank() || s.isBiometricEnabled
+        if (bgAt > 0L && hasSecurityLock && _isPinUnlockedSession.value) {
+            val timeoutMillis = s.autoLockMinutes.coerceAtLeast(1) * 60_000L
+            if (nowMillis - bgAt >= timeoutMillis) {
+                lockAppNow()
+                return
+            }
+        }
+        lastUserInteractionMillis.set(nowMillis)
+    }
+
+    fun checkInactivityTimeout(nowMillis: Long = System.currentTimeMillis()): Boolean {
+        val s = uiState.value.settings
+        val hasSecurityLock = !s.pinHashSha256.isNullOrBlank() || s.isBiometricEnabled
+        if (!hasSecurityLock || !_isPinUnlockedSession.value) return false
+        val timeoutMillis = s.autoLockMinutes.coerceAtLeast(1) * 60_000L
+        val elapsed = nowMillis - lastUserInteractionMillis.get()
+        if (elapsed >= timeoutMillis) {
+            lockAppNow()
+            return true
+        }
+        return false
     }
 
     fun togglePrivacyMode() {
@@ -1200,7 +1248,85 @@ class FinanceVaultViewModel(
 
     fun dismissPendingAiConfirmation() {
         _pendingAiConfirmation.value = null
-        _statusBannerMessage.value = "Cancelled AI transaction."
+        _statusBannerMessage.value = "Cancelled pending AI operation."
+    }
+
+    private suspend fun executePendingConfirmationCommit(
+        context: Context?,
+        pending: PendingAiTransactionConfirmation
+    ): String {
+        if (pending.customCommitAction != null) {
+            return pending.customCommitAction.invoke()
+        }
+        if (pending.operationType == "REVERSE_TRANSACTION" && pending.targetTransactionIdToReverse != null) {
+            val targetTx = uiState.value.transactions.firstOrNull { it.id == pending.targetTransactionIdToReverse }
+            repository.reverseTransaction(pending.targetTransactionIdToReverse)
+            if (targetTx != null) {
+                lastUndoableVoiceAction = UndoableVoiceAction.ReversedTransaction(
+                    snapshot = targetTx,
+                    description = "${InrMoney.formatPaise(targetTx.amountPaise)} (${targetTx.category})"
+                )
+            }
+            return "Confirmed and reversed transaction of ${InrMoney.formatPaise(pending.amountPaise)} for ${pending.category}. Say Undo to restore it."
+        }
+
+        val resolvedSrcId = when {
+            pending.sourceAccountId != null -> pending.sourceAccountId
+            pending.transactionType in setOf(TransactionType.EXPENSE, TransactionType.TRANSFER) ->
+                repository.resolveOrCreateAccountForVoice(pending.sourceAccountName, pending.isDemo).id
+            else -> null
+        }
+        val resolvedDstId = when {
+            pending.destinationAccountId != null && pending.destinationAccountId != resolvedSrcId -> pending.destinationAccountId
+            pending.transactionType == TransactionType.INCOME ->
+                repository.resolveOrCreateAccountForVoice(pending.destinationAccountName, pending.isDemo).id
+            pending.transactionType == TransactionType.TRANSFER -> {
+                val candidate = repository.resolveOrCreateAccountForVoice(
+                    pending.destinationAccountName.ifBlank { "Cash Wallet" },
+                    pending.isDemo
+                )
+                if (candidate.id == resolvedSrcId) {
+                    repository.createAccount(
+                        name = pending.destinationAccountName.ifBlank { "Secondary Account" },
+                        accountType = AccountType.CASH,
+                        openingBalancePaise = 0L,
+                        isOpeningBalanceRecorded = false,
+                        openingDateEpochDay = IndianFinancialYear.todayEpochDay(),
+                        isDemo = pending.isDemo
+                    )
+                } else {
+                    candidate.id
+                }
+            }
+            else -> null
+        }
+
+        val txId = repository.recordTransaction(
+            transactionType = pending.transactionType,
+            dateEpochDay = pending.dateEpochDay,
+            amountPaise = pending.amountPaise,
+            sourceAccountId = resolvedSrcId,
+            destinationAccountId = resolvedDstId,
+            category = pending.category,
+            description = pending.description,
+            locationName = pending.locationName,
+            latitude = pending.latitude,
+            longitude = pending.longitude,
+            isDemo = pending.isDemo
+        )
+        lastUndoableVoiceAction = UndoableVoiceAction.CreatedTransaction(
+            transactionId = txId,
+            description = "${InrMoney.formatPaise(pending.amountPaise)} in ${pending.category}"
+        )
+        if (context != null) {
+            TransactionRecallReminderManager.dismissInAppRecallPrompt(context)
+        }
+        val accLabel = when (pending.transactionType) {
+            TransactionType.INCOME -> "into ${pending.destinationAccountName}"
+            TransactionType.TRANSFER -> "from ${pending.sourceAccountName} to ${pending.destinationAccountName}"
+            else -> "from ${pending.sourceAccountName}"
+        }
+        return "Confirmed & posted ${pending.transactionType.userLabel.lowercase()} of ${InrMoney.formatPaise(pending.amountPaise)} (${pending.category}) $accLabel."
     }
 
     fun confirmPendingAiTransaction(
@@ -1211,39 +1337,92 @@ class FinanceVaultViewModel(
         _pendingAiConfirmation.value = null
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                val txId = repository.recordTransaction(
-                    transactionType = pending.transactionType,
-                    dateEpochDay = pending.dateEpochDay,
-                    amountPaise = pending.amountPaise,
-                    sourceAccountId = pending.sourceAccountId,
-                    destinationAccountId = pending.destinationAccountId,
-                    category = pending.category,
-                    description = pending.description,
-                    locationName = pending.locationName,
-                    latitude = pending.latitude,
-                    longitude = pending.longitude,
-                    isDemo = pending.isDemo
-                )
-                lastUndoableVoiceAction = UndoableVoiceAction.CreatedTransaction(
-                    transactionId = txId,
-                    description = "${InrMoney.formatPaise(pending.amountPaise)} in ${pending.category}"
-                )
-                TransactionRecallReminderManager.dismissInAppRecallPrompt(context)
-                val accLabel = when (pending.transactionType) {
-                    TransactionType.INCOME -> "into ${pending.destinationAccountName}"
-                    TransactionType.TRANSFER -> "from ${pending.sourceAccountName} to ${pending.destinationAccountName}"
-                    else -> "from ${pending.sourceAccountName}"
-                }
-                "Confirmed & posted ${pending.transactionType.userLabel.lowercase()} of ${InrMoney.formatPaise(pending.amountPaise)} (${pending.category}) $accLabel."
+                executePendingConfirmationCommit(context, pending)
             }.onSuccess { msg ->
                 _statusBannerMessage.value = msg
                 onFinished(msg)
             }.onFailure { e ->
-                val err = "Could not post transaction: ${e.message}"
+                val err = "Could not complete operation: ${e.message}"
                 _statusBannerMessage.value = err
                 onFinished(err)
             }
         }
+    }
+
+    private fun stageTransactionReversalPreview(targetTx: TransactionEntity): String {
+        val currentState = uiState.value
+        val srcAccName = targetTx.sourceAccountId?.let { id ->
+            currentState.accountsWithBalances.firstOrNull { it.account.id == id }?.account?.name
+        }.orEmpty()
+        val dstAccName = targetTx.destinationAccountId?.let { id ->
+            currentState.accountsWithBalances.firstOrNull { it.account.id == id }?.account?.name
+        }.orEmpty()
+        _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+            transactionType = targetTx.transactionType,
+            dateEpochDay = targetTx.dateEpochDay,
+            amountPaise = targetTx.amountPaise,
+            sourceAccountId = targetTx.sourceAccountId,
+            sourceAccountName = srcAccName,
+            destinationAccountId = targetTx.destinationAccountId,
+            destinationAccountName = dstAccName,
+            category = targetTx.category,
+            description = targetTx.description,
+            locationName = targetTx.locationName,
+            latitude = targetTx.latitude,
+            longitude = targetTx.longitude,
+            isDemo = targetTx.isDemo,
+            operationType = "REVERSE_TRANSACTION",
+            operationTitle = "Confirm Transaction Reversal",
+            targetTransactionIdToReverse = targetTx.id
+        )
+        return "Prepared reversal for ${InrMoney.formatPaise(targetTx.amountPaise)} (${targetTx.category}). Please confirm on screen or say Confirm."
+    }
+
+    private fun promptForMissingVoiceAmount(
+        title: String,
+        questionPrompt: String,
+        quickAmountsPaise: List<Long> = listOf(100_00L, 500_00L, 1_000_00L, 5_000_00L, 10_000_00L),
+        onAmountProvided: suspend (Long) -> String
+    ): Pair<String, Boolean> {
+        val options = quickAmountsPaise.mapIndexed { idx, paise ->
+            VoiceDisambiguationOption(
+                index = idx + 1,
+                label = InrMoney.formatPaise(paise),
+                subtitle = "Quick amount option",
+                entityId = paise
+            )
+        }
+        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+            title = title,
+            questionPrompt = questionPrompt,
+            options = options,
+            onSelectOption = { chosen ->
+                onAmountProvided(chosen.entityId)
+            },
+            onSpokenAmountProvided = { spokenPaise ->
+                onAmountProvided(spokenPaise)
+            }
+        )
+        return questionPrompt to true
+    }
+
+    private fun resolveAccountCandidateForPreview(
+        spokenHint: String,
+        currentState: FinanceVaultUiState
+    ): Pair<Long?, String> {
+        val activeAccs = currentState.accountsWithBalances.map { it.account }.filter { !it.isArchived }
+        val cleanHint = spokenHint.trim()
+        if (cleanHint.isNotBlank()) {
+            val matched = activeAccs.firstOrNull {
+                it.name.contains(cleanHint, ignoreCase = true) ||
+                    it.bankName.contains(cleanHint, ignoreCase = true) ||
+                    it.accountType.displayName.contains(cleanHint, ignoreCase = true)
+            }
+            if (matched != null) return matched.id to matched.name
+            return null to cleanHint
+        }
+        val first = activeAccs.firstOrNull()
+        return if (first != null) first.id to first.name else null to "Primary Account"
     }
 
     fun cancelActiveVoiceCommand() {
@@ -1500,9 +1679,11 @@ class FinanceVaultViewModel(
                 questionPrompt = question,
                 options = options,
                 onSelectOption = { chosen ->
-                    val liveGpsNow = capturedGps ?: withTimeoutOrNull(2_500L) {
-                        LocationHelper.fetchCurrentLocation(context)
-                    }
+                    val liveGpsNow = if (uiState.value.settings.isLocationTaggingEnabled) {
+                        capturedGps ?: withTimeoutOrNull(2_500L) {
+                            LocationHelper.fetchCurrentLocation(context)
+                        }
+                    } else null
                     val finalLocation = LocationHelper.mergeLocationWithLiveGps(merchantOrPlace, liveGpsNow)
                     val pendingPreview = if (resolvedType == TransactionType.INCOME) {
                         PendingAiTransactionConfirmation(
@@ -1545,18 +1726,20 @@ class FinanceVaultViewModel(
         }
 
         // ALL SLOTS FULFILLED: Present the AI Transaction Confirmation Preview Card for explicit user verification!
-        val liveGpsNow = capturedGps ?: withTimeoutOrNull(2_500L) {
-            LocationHelper.fetchCurrentLocation(context)
-        }
+        val liveGpsNow = if (currentState.settings.isLocationTaggingEnabled) {
+            capturedGps ?: withTimeoutOrNull(2_500L) {
+                LocationHelper.fetchCurrentLocation(context)
+            }
+        } else null
         val finalLocation = LocationHelper.mergeLocationWithLiveGps(merchantOrPlace, liveGpsNow)
 
         val confirmation = runCatching {
             when (resolvedType) {
                 TransactionType.INCOME -> {
-                    val dstAcc = pattern.preferredDestinationAccount
-                        ?: repository.resolveOrCreateAccountForVoice(
-                            spokenAccountHint = tx.destinationAccountHint.ifBlank { tx.sourceAccountHint },
-                            isDemo = isDemo
+                    val (dstId, dstName) = pattern.preferredDestinationAccount?.let { it.id to it.name }
+                        ?: resolveAccountCandidateForPreview(
+                            spokenHint = tx.destinationAccountHint.ifBlank { tx.sourceAccountHint },
+                            currentState = currentState
                         )
                     _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
                         transactionType = TransactionType.INCOME,
@@ -1564,8 +1747,8 @@ class FinanceVaultViewModel(
                         amountPaise = tx.amountPaise,
                         sourceAccountId = null,
                         sourceAccountName = "",
-                        destinationAccountId = dstAcc.id,
-                        destinationAccountName = dstAcc.name,
+                        destinationAccountId = dstId,
+                        destinationAccountName = dstName,
                         category = resolvedCategory,
                         description = cleanDescription,
                         locationName = finalLocation,
@@ -1573,43 +1756,26 @@ class FinanceVaultViewModel(
                         longitude = liveGpsNow?.longitude,
                         isDemo = isDemo
                     )
-                    "Prepared income of ${InrMoney.formatPaise(tx.amountPaise)} for $resolvedCategory into ${dstAcc.name}. Please confirm on screen or say Confirm."
+                    "Prepared income of ${InrMoney.formatPaise(tx.amountPaise)} for $resolvedCategory into $dstName. Please confirm on screen or say Confirm."
                 }
 
                 TransactionType.TRANSFER -> {
-                    val srcAcc = pattern.preferredSourceAccount
-                        ?: repository.resolveOrCreateAccountForVoice(
-                            spokenAccountHint = tx.sourceAccountHint,
-                            isDemo = isDemo
-                        )
-                    val dstAcc = pattern.preferredDestinationAccount
-                        ?: repository.resolveOrCreateAccountForVoice(
-                            spokenAccountHint = tx.destinationAccountHint.ifBlank { "Cash Wallet" },
-                            isDemo = isDemo
-                        )
-                    val finalDstId = if (dstAcc.id == srcAcc.id) {
-                        repository.createAccount(
-                            name = tx.destinationAccountHint.ifBlank { "Secondary Account" },
-                            accountType = AccountType.CASH,
-                            openingBalancePaise = 0L,
-                            isOpeningBalanceRecorded = false,
-                            openingDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                            isDemo = isDemo
-                        )
-                    } else {
-                        dstAcc.id
-                    }
-                    val finalDstName = if (dstAcc.id == srcAcc.id) {
+                    val (srcId, srcName) = pattern.preferredSourceAccount?.let { it.id to it.name }
+                        ?: resolveAccountCandidateForPreview(tx.sourceAccountHint, currentState)
+                    val (rawDstId, rawDstName) = pattern.preferredDestinationAccount?.let { it.id to it.name }
+                        ?: resolveAccountCandidateForPreview(tx.destinationAccountHint.ifBlank { "Cash Wallet" }, currentState)
+                    val finalDstId = if (rawDstId != null && rawDstId == srcId) null else rawDstId
+                    val finalDstName = if (rawDstId != null && rawDstId == srcId) {
                         tx.destinationAccountHint.ifBlank { "Secondary Account" }
                     } else {
-                        dstAcc.name
+                        rawDstName
                     }
                     _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
                         transactionType = TransactionType.TRANSFER,
                         dateEpochDay = IndianFinancialYear.todayEpochDay(),
                         amountPaise = tx.amountPaise,
-                        sourceAccountId = srcAcc.id,
-                        sourceAccountName = srcAcc.name,
+                        sourceAccountId = srcId,
+                        sourceAccountName = srcName,
                         destinationAccountId = finalDstId,
                         destinationAccountName = finalDstName,
                         category = "Account Transfer",
@@ -1619,21 +1785,18 @@ class FinanceVaultViewModel(
                         longitude = liveGpsNow?.longitude,
                         isDemo = isDemo
                     )
-                    "Prepared transfer of ${InrMoney.formatPaise(tx.amountPaise)} from ${srcAcc.name} to $finalDstName. Please confirm on screen or say Confirm."
+                    "Prepared transfer of ${InrMoney.formatPaise(tx.amountPaise)} from $srcName to $finalDstName. Please confirm on screen or say Confirm."
                 }
 
                 else -> {
-                    val srcAcc = pattern.preferredSourceAccount
-                        ?: repository.resolveOrCreateAccountForVoice(
-                            spokenAccountHint = tx.sourceAccountHint,
-                            isDemo = isDemo
-                        )
+                    val (srcId, srcName) = pattern.preferredSourceAccount?.let { it.id to it.name }
+                        ?: resolveAccountCandidateForPreview(tx.sourceAccountHint, currentState)
                     _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
                         transactionType = TransactionType.EXPENSE,
                         dateEpochDay = IndianFinancialYear.todayEpochDay(),
                         amountPaise = tx.amountPaise,
-                        sourceAccountId = srcAcc.id,
-                        sourceAccountName = srcAcc.name,
+                        sourceAccountId = srcId,
+                        sourceAccountName = srcName,
                         destinationAccountId = null,
                         destinationAccountName = "",
                         category = resolvedCategory,
@@ -1643,7 +1806,7 @@ class FinanceVaultViewModel(
                         longitude = liveGpsNow?.longitude,
                         isDemo = isDemo
                     )
-                    "Prepared expense of ${InrMoney.formatPaise(tx.amountPaise)} for $resolvedCategory from ${srcAcc.name}. Please confirm on screen or say Confirm."
+                    "Prepared expense of ${InrMoney.formatPaise(tx.amountPaise)} for $resolvedCategory from $srcName. Please confirm on screen or say Confirm."
                 }
             }
         }.getOrElse { e ->
@@ -1679,31 +1842,13 @@ class FinanceVaultViewModel(
                 if (activeConfirmation != null) {
                     if (lowerUtterance == "confirm" || lowerUtterance == "yes" || lowerUtterance == "post" || lowerUtterance == "post it" || lowerUtterance == "save" || lowerUtterance == "confirm transaction") {
                         _pendingAiConfirmation.value = null
-                        val txId = repository.recordTransaction(
-                            transactionType = activeConfirmation.transactionType,
-                            dateEpochDay = activeConfirmation.dateEpochDay,
-                            amountPaise = activeConfirmation.amountPaise,
-                            sourceAccountId = activeConfirmation.sourceAccountId,
-                            destinationAccountId = activeConfirmation.destinationAccountId,
-                            category = activeConfirmation.category,
-                            description = activeConfirmation.description,
-                            locationName = activeConfirmation.locationName,
-                            latitude = activeConfirmation.latitude,
-                            longitude = activeConfirmation.longitude,
-                            isDemo = activeConfirmation.isDemo
-                        )
-                        lastUndoableVoiceAction = UndoableVoiceAction.CreatedTransaction(
-                            transactionId = txId,
-                            description = "${InrMoney.formatPaise(activeConfirmation.amountPaise)} in ${activeConfirmation.category}"
-                        )
-                        TransactionRecallReminderManager.dismissInAppRecallPrompt(context)
-                        val msg = "Confirmed and recorded ${activeConfirmation.transactionType.userLabel.lowercase()} of ${InrMoney.formatPaise(activeConfirmation.amountPaise)} for ${activeConfirmation.category}."
+                        val msg = executePendingConfirmationCommit(context, activeConfirmation)
                         _statusBannerMessage.value = msg
                         onFinished(msg, null, false)
                         return@launch
                     } else if (lowerUtterance == "cancel" || lowerUtterance == "no" || lowerUtterance == "discard") {
                         _pendingAiConfirmation.value = null
-                        val cancelMsg = "Cancelled pending AI transaction."
+                        val cancelMsg = "Cancelled pending AI operation."
                         _statusBannerMessage.value = cancelMsg
                         onFinished(cancelMsg, null, false)
                         return@launch
@@ -1792,9 +1937,11 @@ class FinanceVaultViewModel(
 
                 when (result.action) {
                     "RECORD_TRANSACTION" -> {
-                        val capturedGps = withTimeoutOrNull(4_200L) {
-                            LocationHelper.fetchCurrentLocation(context)
-                        }
+                        val capturedGps = if (currentState.settings.isLocationTaggingEnabled) {
+                            withTimeoutOrNull(4_200L) {
+                                LocationHelper.fetchCurrentLocation(context)
+                            }
+                        } else null
                         for (tx in result.transactionsToRecord) {
                             val (replyText, needsFollowUp) = processVoiceTransactionWithSlotFilling(
                                 context = context,
@@ -1811,726 +1958,1060 @@ class FinanceVaultViewModel(
                         }
                     }
 
-                "DELETE_TRANSACTION", "REVERSE_LAST_TRANSACTION" -> {
-                    val activeTxs = currentState.transactions.filter { !it.isReversed }
-                    if (activeTxs.isEmpty()) {
-                        finalSpokenReply = "There are no active transactions to delete."
-                    } else {
-                        val isExplicitLatest = result.action == "REVERSE_LAST_TRANSACTION" ||
-                            result.frequencyOrTypeHint.equals("LATEST", ignoreCase = true) ||
-                            (result.entityName.isBlank() && result.primaryAmountPaise <= 0L)
-
-                        if (isExplicitLatest || activeTxs.size == 1) {
-                            val targetTx = activeTxs.first()
-                            repository.reverseTransaction(targetTx.id)
-                            lastUndoableVoiceAction = UndoableVoiceAction.ReversedTransaction(
-                                snapshot = targetTx,
-                                description = "${InrMoney.formatPaise(targetTx.amountPaise)} (${targetTx.category})"
-                            )
-                            finalSpokenReply = "Deleted transaction of ${InrMoney.formatPaise(targetTx.amountPaise)} for ${targetTx.category}. Say Undo to restore it."
+                    "DELETE_TRANSACTION", "REVERSE_LAST_TRANSACTION" -> {
+                        val activeTxs = currentState.transactions.filter { !it.isReversed && it.isDemo == isDemo }
+                        if (activeTxs.isEmpty()) {
+                            finalSpokenReply = "There are no active transactions to delete."
                         } else {
                             val keyword = result.entityName.trim()
                             val amtFilter = result.primaryAmountPaise
-                            val matchedTxs = activeTxs.filter { tx ->
-                                val amtMatches = amtFilter <= 0L || tx.amountPaise == amtFilter
-                                val keywordMatches = keyword.isBlank() ||
-                                    tx.category.contains(keyword, ignoreCase = true) ||
-                                    tx.description.contains(keyword, ignoreCase = true) ||
-                                    tx.locationName.contains(keyword, ignoreCase = true) ||
-                                    keyword.split(" ").filter { it.length >= 3 }.any { tok ->
-                                        tx.category.contains(tok, ignoreCase = true) ||
-                                            tx.description.contains(tok, ignoreCase = true) ||
-                                            tx.locationName.contains(tok, ignoreCase = true)
-                                    }
-                                amtMatches && keywordMatches
-                            }
+                            val isExplicitLatest = result.action == "REVERSE_LAST_TRANSACTION" ||
+                                result.frequencyOrTypeHint.equals("LATEST", ignoreCase = true)
 
-                            when {
-                                matchedTxs.size == 1 -> {
-                                    val targetTx = matchedTxs.first()
-                                    repository.reverseTransaction(targetTx.id)
-                                    lastUndoableVoiceAction = UndoableVoiceAction.ReversedTransaction(
-                                        snapshot = targetTx,
-                                        description = "${InrMoney.formatPaise(targetTx.amountPaise)} (${targetTx.category})"
+                            if (isExplicitLatest && keyword.isBlank() && amtFilter <= 0L) {
+                                val targetTx = activeTxs.first()
+                                finalSpokenReply = stageTransactionReversalPreview(targetTx)
+                            } else if (keyword.isBlank() && amtFilter <= 0L) {
+                                // Ambiguous delete request without keyword, amount, or explicit "latest"
+                                val options = activeTxs.take(5).mapIndexed { idx, tx ->
+                                    val place = if (tx.locationName.isNotBlank()) " @ ${tx.locationName}" else ""
+                                    VoiceDisambiguationOption(
+                                        index = idx + 1,
+                                        label = "${InrMoney.formatPaise(tx.amountPaise)} • ${tx.category}$place",
+                                        subtitle = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
+                                        entityId = tx.id
                                     )
-                                    finalSpokenReply = "Deleted transaction of ${InrMoney.formatPaise(targetTx.amountPaise)} for ${targetTx.category}. Say Undo to restore it."
                                 }
-                                matchedTxs.size > 1 -> {
-                                    val options = matchedTxs.take(5).mapIndexed { idx, tx ->
-                                        val place = if (tx.locationName.isNotBlank()) " @ ${tx.locationName}" else ""
-                                        VoiceDisambiguationOption(
-                                            index = idx + 1,
-                                            label = "${InrMoney.formatPaise(tx.amountPaise)} • ${tx.category}$place",
-                                            subtitle = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
-                                            entityId = tx.id
-                                        )
+                                val q = "Which transaction would you like to reverse: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                                _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                    title = "Select Transaction to Reverse",
+                                    questionPrompt = q,
+                                    options = options,
+                                    onSelectOption = { chosen ->
+                                        val tx = uiState.value.transactions.firstOrNull { it.id == chosen.entityId && !it.isReversed }
+                                            ?: throw IllegalArgumentException("Transaction not found.")
+                                        stageTransactionReversalPreview(tx)
                                     }
-                                    val q = "Multiple transactions match. Which one should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                                    _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                                        title = "Select Transaction to Delete",
-                                        questionPrompt = q,
-                                        options = options,
-                                        onSelectOption = { chosen ->
-                                            val tx = currentState.transactions.firstOrNull { it.id == chosen.entityId }
-                                            if (tx != null) {
-                                                lastUndoableVoiceAction = UndoableVoiceAction.ReversedTransaction(
-                                                    snapshot = tx,
-                                                    description = "${InrMoney.formatPaise(tx.amountPaise)} (${tx.category})"
+                                )
+                                finalSpokenReply = q
+                                listenForFollowUp = true
+                            } else {
+                                // Filter transactions BEFORE deciding whether a match is unique!
+                                val matchedTxs = activeTxs.filter { tx ->
+                                    val amtMatches = amtFilter <= 0L || tx.amountPaise == amtFilter
+                                    val keywordMatches = keyword.isBlank() ||
+                                        tx.category.contains(keyword, ignoreCase = true) ||
+                                        tx.description.contains(keyword, ignoreCase = true) ||
+                                        tx.locationName.contains(keyword, ignoreCase = true) ||
+                                        keyword.split(" ").filter { it.length >= 3 }.any { tok ->
+                                            tx.category.contains(tok, ignoreCase = true) ||
+                                                tx.description.contains(tok, ignoreCase = true) ||
+                                                tx.locationName.contains(tok, ignoreCase = true)
+                                        }
+                                    amtMatches && keywordMatches
+                                }
+
+                                when {
+                                    matchedTxs.size == 1 -> {
+                                        val targetTx = matchedTxs.first()
+                                        finalSpokenReply = stageTransactionReversalPreview(targetTx)
+                                    }
+                                    matchedTxs.size > 1 -> {
+                                        if (isExplicitLatest) {
+                                            val targetTx = matchedTxs.first()
+                                            finalSpokenReply = stageTransactionReversalPreview(targetTx)
+                                        } else {
+                                            val options = matchedTxs.take(5).mapIndexed { idx, tx ->
+                                                val place = if (tx.locationName.isNotBlank()) " @ ${tx.locationName}" else ""
+                                                VoiceDisambiguationOption(
+                                                    index = idx + 1,
+                                                    label = "${InrMoney.formatPaise(tx.amountPaise)} • ${tx.category}$place",
+                                                    subtitle = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
+                                                    entityId = tx.id
                                                 )
                                             }
-                                            repository.reverseTransaction(chosen.entityId)
-                                            "Deleted transaction ${chosen.label}. Say Undo to restore it."
+                                            val q = "Multiple transactions match. Which one should I reverse: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                                title = "Select Transaction to Reverse",
+                                                questionPrompt = q,
+                                                options = options,
+                                                onSelectOption = { chosen ->
+                                                    val tx = uiState.value.transactions.firstOrNull { it.id == chosen.entityId && !it.isReversed }
+                                                        ?: throw IllegalArgumentException("Transaction not found.")
+                                                    stageTransactionReversalPreview(tx)
+                                                }
+                                            )
+                                            finalSpokenReply = q
+                                            listenForFollowUp = true
                                         }
-                                    )
-                                    finalSpokenReply = q
-                                    listenForFollowUp = true
-                                }
-                                else -> {
-                                    // No exact keyword match: ask from the most recent transactions
-                                    val options = activeTxs.take(5).mapIndexed { idx, tx ->
-                                        val place = if (tx.locationName.isNotBlank()) " @ ${tx.locationName}" else ""
-                                        VoiceDisambiguationOption(
-                                            index = idx + 1,
-                                            label = "${InrMoney.formatPaise(tx.amountPaise)} • ${tx.category}$place",
-                                            subtitle = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
-                                            entityId = tx.id
-                                        )
                                     }
-                                    val q = "Which recent transaction should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                                    _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                                        title = "Select Transaction to Delete",
-                                        questionPrompt = q,
-                                        options = options,
-                                        onSelectOption = { chosen ->
-                                            val tx = currentState.transactions.firstOrNull { it.id == chosen.entityId }
-                                            if (tx != null) {
-                                                lastUndoableVoiceAction = UndoableVoiceAction.ReversedTransaction(
-                                                    snapshot = tx,
-                                                    description = "${InrMoney.formatPaise(tx.amountPaise)} (${tx.category})"
-                                                )
-                                            }
-                                            repository.reverseTransaction(chosen.entityId)
-                                            "Deleted transaction ${chosen.label}. Say Undo to restore it."
+                                    else -> {
+                                        // No reliable match exists: NEVER delete an unrelated transaction! Ask for clarification.
+                                        val options = activeTxs.take(5).mapIndexed { idx, tx ->
+                                            val place = if (tx.locationName.isNotBlank()) " @ ${tx.locationName}" else ""
+                                            VoiceDisambiguationOption(
+                                                index = idx + 1,
+                                                label = "${InrMoney.formatPaise(tx.amountPaise)} • ${tx.category}$place",
+                                                subtitle = IndianFinancialYear.formatEpochDay(tx.dateEpochDay),
+                                                entityId = tx.id
+                                            )
                                         }
-                                    )
-                                    finalSpokenReply = q
-                                    listenForFollowUp = true
+                                        val mismatchCriterion = when {
+                                            keyword.isNotBlank() && amtFilter > 0L -> "'$keyword' for ${InrMoney.formatPaise(amtFilter)}"
+                                            keyword.isNotBlank() -> "'$keyword'"
+                                            else -> InrMoney.formatPaise(amtFilter)
+                                        }
+                                        val q = "No transaction matched $mismatchCriterion. Which transaction would you like to reverse: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                            title = "No Match for $mismatchCriterion — Select Transaction",
+                                            questionPrompt = q,
+                                            options = options,
+                                            onSelectOption = { chosen ->
+                                                val tx = uiState.value.transactions.firstOrNull { it.id == chosen.entityId && !it.isReversed }
+                                                    ?: throw IllegalArgumentException("Transaction not found.")
+                                                stageTransactionReversalPreview(tx)
+                                            }
+                                        )
+                                        finalSpokenReply = q
+                                        listenForFollowUp = true
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                "UNDO_LAST_ACTION" -> {
-                    val undoable = lastUndoableVoiceAction
-                    lastUndoableVoiceAction = null
-                    when (undoable) {
-                        is UndoableVoiceAction.CreatedTransaction -> {
-                            repository.reverseTransaction(undoable.transactionId)
-                            finalSpokenReply = "Undid transaction: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.ReversedTransaction -> {
-                            val snap = undoable.snapshot
-                            repository.recordTransaction(
-                                transactionType = snap.transactionType,
-                                dateEpochDay = snap.dateEpochDay,
-                                amountPaise = snap.amountPaise,
-                                principalComponentPaise = snap.principalComponentPaise,
-                                interestComponentPaise = snap.interestComponentPaise,
-                                chargesPaise = snap.chargesPaise,
-                                costBasisDisposedPaise = snap.costBasisDisposedPaise,
-                                sourceAccountId = snap.sourceAccountId,
-                                destinationAccountId = snap.destinationAccountId,
-                                category = snap.category,
-                                description = snap.description,
-                                referenceNumber = snap.referenceNumber,
-                                notes = snap.notes,
-                                locationName = snap.locationName,
-                                latitude = snap.latitude,
-                                longitude = snap.longitude,
-                                isDemo = snap.isDemo
-                            )
-                            finalSpokenReply = "Restored transaction: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.CreatedSubscription -> {
-                            repository.deleteSubscription(undoable.subscriptionId)
-                            finalSpokenReply = "Removed subscription: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.DeletedSubscription -> {
-                            val sub = undoable.snapshot
-                            repository.addSubscription(
-                                name = sub.name,
-                                costPaise = sub.costPaise,
-                                billingFrequency = sub.billingFrequency,
-                                nextRenewalEpochDay = sub.nextRenewalEpochDay,
-                                paymentAccountId = sub.paymentAccountId,
-                                notes = sub.notes,
-                                isDemo = sub.isDemo,
-                                customIntervalCount = sub.customIntervalCount,
-                                customIntervalUnit = sub.customIntervalUnit
-                            )
-                            finalSpokenReply = "Restored subscription: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.CreatedBudget -> {
-                            repository.deleteBudget(undoable.budgetId)
-                            finalSpokenReply = "Removed budget: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.DeletedBudget -> {
-                            val b = undoable.snapshot
-                            repository.addBudget(
-                                name = b.name,
-                                budgetPeriod = b.budgetPeriod,
-                                category = b.category,
-                                limitPaise = b.limitPaise,
-                                financialYear = b.financialYear,
-                                notes = b.notes,
-                                isDemo = b.isDemo
-                            )
-                            finalSpokenReply = "Restored budget: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.CreatedGoal -> {
-                            repository.deleteGoal(undoable.goalId)
-                            finalSpokenReply = "Removed goal: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.DeletedGoal -> {
-                            val g = undoable.snapshot
-                            repository.addGoal(
-                                name = g.name,
-                                goalType = g.goalType,
-                                targetAmountPaise = g.targetAmountPaise,
-                                currentSavedPaise = g.currentSavedPaise,
-                                targetDateEpochDay = g.targetDateEpochDay,
-                                linkedAccountId = g.linkedAccountId,
-                                notes = g.notes,
-                                isDemo = g.isDemo
-                            )
-                            finalSpokenReply = "Restored savings goal: ${undoable.description}."
-                        }
-                        is UndoableVoiceAction.ArchivedAccount -> {
-                            repository.archiveAccount(undoable.accountId, false)
-                            finalSpokenReply = "Restored account: ${undoable.description}."
-                        }
-                        null -> {
-                            finalSpokenReply = "There is no recent voice action to undo."
-                        }
-                    }
-                }
-
-                "CREATE_ACCOUNT" -> {
-                    val accType = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
-                        "CASH" -> AccountType.CASH
-                        "UPI" -> AccountType.UPI
-                        "UPI_WALLET", "WALLET", "DIGITAL_WALLET" -> AccountType.DIGITAL_WALLET
-                        "CREDIT_CARD" -> AccountType.CREDIT_CARD
-                        "SAVINGS" -> AccountType.SAVINGS
-                        "CURRENT" -> AccountType.CURRENT
-                        "DEMAT", "OTHER" -> AccountType.OTHER
-                        else -> AccountType.BANK
-                    }
-                    val accName = result.entityName.ifBlank { "New ${accType.displayName}" }
-                    repository.createAccount(
-                        name = accName,
-                        accountType = accType,
-                        bankName = if (accType == AccountType.BANK) accName else "",
-                        openingBalancePaise = result.primaryAmountPaise,
-                        isOpeningBalanceRecorded = result.primaryAmountPaise > 0L,
-                        openingDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        isDemo = isDemo
-                    )
-                }
-
-                "ARCHIVE_ACCOUNT" -> {
-                    val activeAccs = currentState.accountsWithBalances.map { it.account }.filter { !it.isArchived }
-                    val matched = activeAccs.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    if (activeAccs.isEmpty()) {
-                        finalSpokenReply = "There are no active accounts to delete or archive."
-                    } else if (matched.size == 1 || (activeAccs.size == 1 && result.entityName.isBlank())) {
-                        val target = matched.firstOrNull() ?: activeAccs.first()
-                        repository.archiveAccount(target.id, true)
-                        lastUndoableVoiceAction = UndoableVoiceAction.ArchivedAccount(target.id, target.name)
-                        finalSpokenReply = "Archived account ${target.name}. Say Undo to restore it."
-                    } else {
-                        val candidates = if (matched.isNotEmpty()) matched else activeAccs
-                        val options = candidates.take(5).mapIndexed { idx, acc ->
-                            VoiceDisambiguationOption(idx + 1, acc.name, acc.accountType.displayName, acc.id)
-                        }
-                        val q = "Which account would you like to delete or archive: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Account to Archive",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                repository.archiveAccount(chosen.entityId, true)
-                                lastUndoableVoiceAction = UndoableVoiceAction.ArchivedAccount(chosen.entityId, chosen.label)
-                                "Archived account ${chosen.label}. Say Undo to restore it."
+                    "UNDO_LAST_ACTION" -> {
+                        val undoable = lastUndoableVoiceAction
+                        lastUndoableVoiceAction = null
+                        when (undoable) {
+                            is UndoableVoiceAction.CreatedTransaction -> {
+                                repository.reverseTransaction(undoable.transactionId)
+                                finalSpokenReply = "Undid transaction: ${undoable.description}."
                             }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    }
-                }
-
-                "ADD_SUBSCRIPTION" -> {
-                    val upperHint = result.frequencyOrTypeHint.uppercase(java.util.Locale.US)
-                    val freq = when (upperHint) {
-                        "BIMONTHLY" -> BillingFrequency.BIMONTHLY
-                        "FOUR_MONTHLY" -> BillingFrequency.FOUR_MONTHLY
-                        "QUARTERLY" -> BillingFrequency.QUARTERLY
-                        "HALF_YEARLY" -> BillingFrequency.HALF_YEARLY
-                        "YEARLY", "ANNUALLY" -> BillingFrequency.ANNUALLY
-                        "WEEKLY", "CUSTOM" -> BillingFrequency.CUSTOM
-                        else -> BillingFrequency.MONTHLY
-                    }
-                    val customUnit = if (upperHint == "WEEKLY") "DAYS" else "MONTHS"
-                    val customCount = if (upperHint == "WEEKLY") 7 else result.tenureOrIntervalCount.coerceAtLeast(1)
-                    val subName = result.entityName.ifBlank { "Subscription" }
-                    val cost = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val today = IndianFinancialYear.todayEpochDay()
-                    val nextRen = IndianFinancialYear.advanceSubscriptionRenewalEpochDay(
-                        fromEpochDay = today,
-                        frequency = freq,
-                        customIntervalUnit = customUnit,
-                        customIntervalCount = customCount
-                    )
-                    val defaultAccId = currentState.accountsWithBalances.firstOrNull { !it.account.isArchived }?.account?.id
-                    repository.addSubscription(
-                        name = subName,
-                        costPaise = cost,
-                        billingFrequency = freq,
-                        nextRenewalEpochDay = nextRen,
-                        paymentAccountId = defaultAccId,
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo,
-                        customIntervalUnit = customUnit,
-                        customIntervalCount = customCount
-                    )
-                }
-
-                "PAY_SUBSCRIPTION" -> {
-                    val subs = currentState.subscriptions
-                    val matched = subs.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    val defaultAcc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
-                    if (matched.size == 1) {
-                        val sub = matched.first()
-                        repository.recordSubscriptionPaymentNow(sub.id, sub.paymentAccountId ?: defaultAcc.id)
-                        finalSpokenReply = "Recorded payment of ${InrMoney.formatPaise(sub.costPaise)} for ${sub.name} and advanced its renewal date."
-                    } else if (subs.size == 1 && result.entityName.isBlank()) {
-                        val sub = subs.first()
-                        repository.recordSubscriptionPaymentNow(sub.id, sub.paymentAccountId ?: defaultAcc.id)
-                        finalSpokenReply = "Recorded payment of ${InrMoney.formatPaise(sub.costPaise)} for ${sub.name}."
-                    } else if (subs.isNotEmpty()) {
-                        val candidates = if (matched.isNotEmpty()) matched else subs
-                        val options = candidates.take(5).mapIndexed { idx, sub ->
-                            VoiceDisambiguationOption(
-                                index = idx + 1,
-                                label = sub.name,
-                                subtitle = "${InrMoney.formatPaise(sub.costPaise)} • ${sub.cycleLabel()}",
-                                entityId = sub.id
-                            )
-                        }
-                        val q = "Which subscription would you like to pay: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Subscription to Pay",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                val sub = currentState.subscriptions.firstOrNull { it.id == chosen.entityId }
-                                repository.recordSubscriptionPaymentNow(chosen.entityId, sub?.paymentAccountId ?: defaultAcc.id)
-                                "Recorded subscription payment for ${chosen.label}."
-                            }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    } else {
-                        finalSpokenReply = "You have no active subscriptions to pay."
-                    }
-                }
-
-                "DELETE_SUBSCRIPTION" -> {
-                    val subs = currentState.subscriptions
-                    val matched = subs.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    if (subs.isEmpty()) {
-                        finalSpokenReply = "You have no active subscriptions to delete."
-                    } else if (matched.size == 1 || (subs.size == 1 && result.entityName.isBlank())) {
-                        val sub = matched.firstOrNull() ?: subs.first()
-                        repository.deleteSubscription(sub.id)
-                        lastUndoableVoiceAction = UndoableVoiceAction.DeletedSubscription(sub, sub.name)
-                        finalSpokenReply = "Deleted ${sub.name} subscription. Say Undo to restore it."
-                    } else {
-                        val candidates = if (matched.isNotEmpty()) matched else subs
-                        val options = candidates.take(5).mapIndexed { idx, sub ->
-                            VoiceDisambiguationOption(idx + 1, sub.name, InrMoney.formatPaise(sub.costPaise), sub.id)
-                        }
-                        val q = "Which subscription should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Subscription to Delete",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                val sub = currentState.subscriptions.firstOrNull { it.id == chosen.entityId }
-                                if (sub != null) {
-                                    lastUndoableVoiceAction = UndoableVoiceAction.DeletedSubscription(sub, sub.name)
-                                }
-                                repository.deleteSubscription(chosen.entityId)
-                                "Deleted ${chosen.label} subscription. Say Undo to restore it."
-                            }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    }
-                }
-
-                "ADD_INVESTMENT" -> {
-                    val invCat = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
-                        "EQUITY_SHARES", "STOCK", "EQUITY" -> InvestmentCategory.EQUITY_SHARES
-                        "ETF" -> InvestmentCategory.ETF
-                        "SIP" -> InvestmentCategory.SIP
-                        "FIXED_DEPOSIT", "FD" -> InvestmentCategory.FIXED_DEPOSIT
-                        "RECURRING_DEPOSIT", "RD" -> InvestmentCategory.RECURRING_DEPOSIT
-                        "PPF", "NPS", "GOVT_SECURITIES" -> InvestmentCategory.GOVT_SECURITIES
-                        "GOLD" -> InvestmentCategory.GOLD
-                        "SILVER" -> InvestmentCategory.SILVER
-                        "BONDS" -> InvestmentCategory.BONDS
-                        "REAL_ESTATE", "OTHER" -> InvestmentCategory.OTHER
-                        else -> InvestmentCategory.MUTUAL_FUND
-                    }
-                    val amt = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val payAcc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
-                    repository.addInvestment(
-                        name = result.entityName.ifBlank { "Portfolio Investment" },
-                        category = invCat,
-                        purchaseDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        quantity = 1.0,
-                        units = 1.0,
-                        purchasePricePerUnitPaise = amt,
-                        investedAmountPaise = amt,
-                        chargesPaise = 0L,
-                        currentRecordedValuePaise = amt,
-                        isCurrentValueRecorded = true,
-                        paymentAccountId = payAcc.id,
-                        maturityDateEpochDay = null,
-                        annualInterestRatePercent = result.ratePercent,
-                        compoundingFrequency = CompoundingFrequency.ANNUALLY,
-                        durationMonths = result.tenureOrIntervalCount.coerceAtLeast(12),
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                }
-
-                "ADD_LOAN" -> {
-                    val lType = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
-                        "HOME" -> LoanType.HOME
-                        "VEHICLE", "CAR" -> LoanType.VEHICLE
-                        "EDUCATION" -> LoanType.EDUCATION
-                        "GOLD", "CREDIT_CARD", "OTHER" -> LoanType.OTHER
-                        else -> LoanType.PERSONAL
-                    }
-                    val prin = result.primaryAmountPaise.coerceAtLeast(100000L)
-                    val acc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
-                    repository.addLoan(
-                        name = result.entityName.ifBlank { lType.displayName },
-                        loanType = lType,
-                        lenderName = result.entityName.ifBlank { "Bank Lender" },
-                        principalPaise = prin,
-                        annualInterestRatePercent = result.ratePercent.coerceAtLeast(1.0),
-                        tenureMonths = result.tenureOrIntervalCount.coerceAtLeast(12),
-                        startDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        disbursedToAccountId = acc.id,
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                }
-
-                "PAY_LOAN_EMI" -> {
-                    val activeLoans = currentState.loans.filter { !it.isClosed }
-                    val matched = activeLoans.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    val srcAcc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
-                    if (matched.size == 1 || (activeLoans.size == 1 && result.entityName.isBlank())) {
-                        val loan = matched.firstOrNull() ?: activeLoans.first()
-                        repository.recordTransaction(
-                            transactionType = TransactionType.LOAN_REPAYMENT,
-                            dateEpochDay = IndianFinancialYear.todayEpochDay(),
-                            amountPaise = loan.emiAmountPaise,
-                            principalComponentPaise = loan.emiAmountPaise,
-                            interestComponentPaise = 0L,
-                            sourceAccountId = srcAcc.id,
-                            category = "Loan EMI Repayment",
-                            description = "EMI Repayment for ${loan.name}",
-                            linkedLoanId = loan.id,
-                            isDemo = isDemo
-                        )
-                        finalSpokenReply = "Recorded EMI payment of ${InrMoney.formatPaise(loan.emiAmountPaise)} for ${loan.name}."
-                    } else if (activeLoans.size > 1) {
-                        val options = activeLoans.take(5).mapIndexed { idx, l ->
-                            VoiceDisambiguationOption(
-                                index = idx + 1,
-                                label = l.name,
-                                subtitle = "EMI: ${InrMoney.formatPaise(l.emiAmountPaise)}",
-                                entityId = l.id
-                            )
-                        }
-                        val q = "Which loan EMI would you like to pay: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Loan EMI to Pay",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                val loan = currentState.loans.first { it.id == chosen.entityId }
+                            is UndoableVoiceAction.ReversedTransaction -> {
+                                val snap = undoable.snapshot
                                 repository.recordTransaction(
-                                    transactionType = TransactionType.LOAN_REPAYMENT,
-                                    dateEpochDay = IndianFinancialYear.todayEpochDay(),
-                                    amountPaise = loan.emiAmountPaise,
-                                    principalComponentPaise = loan.emiAmountPaise,
-                                    interestComponentPaise = 0L,
-                                    sourceAccountId = srcAcc.id,
-                                    category = "Loan EMI Repayment",
-                                    description = "EMI Repayment for ${loan.name}",
-                                    linkedLoanId = loan.id,
+                                    transactionType = snap.transactionType,
+                                    dateEpochDay = snap.dateEpochDay,
+                                    amountPaise = snap.amountPaise,
+                                    principalComponentPaise = snap.principalComponentPaise,
+                                    interestComponentPaise = snap.interestComponentPaise,
+                                    chargesPaise = snap.chargesPaise,
+                                    costBasisDisposedPaise = snap.costBasisDisposedPaise,
+                                    sourceAccountId = snap.sourceAccountId,
+                                    destinationAccountId = snap.destinationAccountId,
+                                    category = snap.category,
+                                    description = snap.description,
+                                    referenceNumber = snap.referenceNumber,
+                                    notes = snap.notes,
+                                    locationName = snap.locationName,
+                                    latitude = snap.latitude,
+                                    longitude = snap.longitude,
+                                    isDemo = snap.isDemo
+                                )
+                                finalSpokenReply = "Restored transaction: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.CreatedSubscription -> {
+                                repository.deleteSubscription(undoable.subscriptionId)
+                                finalSpokenReply = "Removed subscription: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.DeletedSubscription -> {
+                                val sub = undoable.snapshot
+                                repository.addSubscription(
+                                    name = sub.name,
+                                    costPaise = sub.costPaise,
+                                    billingFrequency = sub.billingFrequency,
+                                    nextRenewalEpochDay = sub.nextRenewalEpochDay,
+                                    paymentAccountId = sub.paymentAccountId,
+                                    notes = sub.notes,
+                                    isDemo = sub.isDemo,
+                                    customIntervalCount = sub.customIntervalCount,
+                                    customIntervalUnit = sub.customIntervalUnit
+                                )
+                                finalSpokenReply = "Restored subscription: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.CreatedBudget -> {
+                                repository.deleteBudget(undoable.budgetId)
+                                finalSpokenReply = "Removed budget: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.DeletedBudget -> {
+                                val b = undoable.snapshot
+                                repository.addBudget(
+                                    name = b.name,
+                                    budgetPeriod = b.budgetPeriod,
+                                    category = b.category,
+                                    limitPaise = b.limitPaise,
+                                    financialYear = b.financialYear,
+                                    notes = b.notes,
+                                    isDemo = b.isDemo
+                                )
+                                finalSpokenReply = "Restored budget: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.CreatedGoal -> {
+                                repository.deleteGoal(undoable.goalId)
+                                finalSpokenReply = "Removed goal: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.DeletedGoal -> {
+                                val g = undoable.snapshot
+                                repository.addGoal(
+                                    name = g.name,
+                                    goalType = g.goalType,
+                                    targetAmountPaise = g.targetAmountPaise,
+                                    currentSavedPaise = g.currentSavedPaise,
+                                    targetDateEpochDay = g.targetDateEpochDay,
+                                    linkedAccountId = g.linkedAccountId,
+                                    notes = g.notes,
+                                    isDemo = g.isDemo
+                                )
+                                finalSpokenReply = "Restored savings goal: ${undoable.description}."
+                            }
+                            is UndoableVoiceAction.ArchivedAccount -> {
+                                repository.archiveAccount(undoable.accountId, false)
+                                finalSpokenReply = "Restored account: ${undoable.description}."
+                            }
+                            null -> {
+                                finalSpokenReply = "There is no recent voice action to undo."
+                            }
+                        }
+                    }
+
+                    "CREATE_ACCOUNT" -> {
+                        val accType = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
+                            "CASH" -> AccountType.CASH
+                            "UPI" -> AccountType.UPI
+                            "UPI_WALLET", "WALLET", "DIGITAL_WALLET" -> AccountType.DIGITAL_WALLET
+                            "CREDIT_CARD" -> AccountType.CREDIT_CARD
+                            "SAVINGS" -> AccountType.SAVINGS
+                            "CURRENT" -> AccountType.CURRENT
+                            "DEMAT", "OTHER" -> AccountType.OTHER
+                            else -> AccountType.BANK
+                        }
+                        val accName = result.entityName.ifBlank { "New ${accType.displayName}" }
+                        val openBal = result.primaryAmountPaise.coerceAtLeast(0L)
+                        _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                            transactionType = TransactionType.OPENING_BALANCE,
+                            dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                            amountPaise = openBal,
+                            destinationAccountName = accName,
+                            category = accType.displayName,
+                            description = "Create Account: $accName",
+                            isDemo = isDemo,
+                            operationType = "CREATE_ACCOUNT",
+                            operationTitle = "Confirm Account Creation",
+                            customCommitAction = {
+                                repository.createAccount(
+                                    name = accName,
+                                    accountType = accType,
+                                    bankName = if (accType == AccountType.BANK) accName else "",
+                                    openingBalancePaise = openBal,
+                                    isOpeningBalanceRecorded = openBal > 0L,
+                                    openingDateEpochDay = IndianFinancialYear.todayEpochDay(),
                                     isDemo = isDemo
                                 )
-                                "Recorded EMI payment of ${InrMoney.formatPaise(loan.emiAmountPaise)} for ${loan.name}."
+                                "Confirmed and created account '$accName' (${accType.displayName})."
                             }
                         )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    } else {
-                        finalSpokenReply = "You have no active loans for EMI repayment."
+                        finalSpokenReply = "Prepared new account $accName (${accType.displayName}) with opening balance ${InrMoney.formatPaise(openBal)}. Please confirm on screen or say Confirm."
                     }
-                }
 
-                "ADD_BUDGET" -> {
-                    val cat = result.categoryOrScope.ifBlank { "OVERALL" }
-                    val limit = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val budgetId = repository.addBudget(
-                        name = result.entityName.ifBlank { if (cat == "OVERALL") "Overall Monthly Budget" else "$cat Budget" },
-                        budgetPeriod = BudgetPeriod.MONTHLY,
-                        category = cat,
-                        limitPaise = limit,
-                        financialYear = currentState.settings.activeFinancialYear,
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                    lastUndoableVoiceAction = UndoableVoiceAction.CreatedBudget(budgetId, "$cat Budget")
-                }
-
-                "DELETE_BUDGET" -> {
-                    val budgets = currentState.budgets
-                    val matched = budgets.filter {
-                        result.entityName.isNotBlank() && (
-                            it.name.contains(result.entityName, ignoreCase = true) ||
-                                it.category.contains(result.entityName, ignoreCase = true)
-                            )
-                    }
-                    if (budgets.isEmpty()) {
-                        finalSpokenReply = "You have no active budgets to delete."
-                    } else if (matched.size == 1 || (budgets.size == 1 && result.entityName.isBlank())) {
-                        val b = matched.firstOrNull() ?: budgets.first()
-                        repository.deleteBudget(b.id)
-                        lastUndoableVoiceAction = UndoableVoiceAction.DeletedBudget(b, b.name)
-                        finalSpokenReply = "Deleted ${b.name}. Say Undo to restore it."
-                    } else {
-                        val candidates = if (matched.isNotEmpty()) matched else budgets
-                        val options = candidates.take(5).mapIndexed { idx, b ->
-                            VoiceDisambiguationOption(idx + 1, b.name, InrMoney.formatPaise(b.limitPaise), b.id)
+                    "ARCHIVE_ACCOUNT" -> {
+                        val activeAccs = currentState.accountsWithBalances.map { it.account }.filter { !it.isArchived }
+                        val matched = activeAccs.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
                         }
-                        val q = "Which budget should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Budget to Delete",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                val b = currentState.budgets.firstOrNull { it.id == chosen.entityId }
-                                if (b != null) {
+                        fun stageArchiveAccount(target: AccountEntity): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = 0L,
+                                sourceAccountId = target.id,
+                                sourceAccountName = target.name,
+                                category = target.accountType.displayName,
+                                description = "Archive Account: ${target.name}",
+                                isDemo = isDemo,
+                                operationType = "ARCHIVE_ACCOUNT",
+                                operationTitle = "Confirm Account Archive",
+                                customCommitAction = {
+                                    repository.archiveAccount(target.id, true)
+                                    lastUndoableVoiceAction = UndoableVoiceAction.ArchivedAccount(target.id, target.name)
+                                    "Confirmed and archived account ${target.name}. Say Undo to restore it."
+                                }
+                            )
+                            return "Prepared to archive account ${target.name}. Please confirm on screen or say Confirm."
+                        }
+                        if (activeAccs.isEmpty()) {
+                            finalSpokenReply = "There are no active accounts to delete or archive."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stageArchiveAccount(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else activeAccs
+                            val options = candidates.take(5).mapIndexed { idx, acc ->
+                                VoiceDisambiguationOption(idx + 1, acc.name, acc.accountType.displayName, acc.id)
+                            }
+                            val q = "Which account would you like to archive: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Account to Archive",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val acc = uiState.value.accountsWithBalances.firstOrNull { it.account.id == chosen.entityId }?.account
+                                        ?: throw IllegalArgumentException("Account not found.")
+                                    stageArchiveAccount(acc)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
+                        }
+                    }
+
+                    "ADD_SUBSCRIPTION" -> {
+                        val upperHint = result.frequencyOrTypeHint.uppercase(java.util.Locale.US)
+                        val freq = when (upperHint) {
+                            "BIMONTHLY" -> BillingFrequency.BIMONTHLY
+                            "FOUR_MONTHLY" -> BillingFrequency.FOUR_MONTHLY
+                            "QUARTERLY" -> BillingFrequency.QUARTERLY
+                            "HALF_YEARLY" -> BillingFrequency.HALF_YEARLY
+                            "YEARLY", "ANNUALLY" -> BillingFrequency.ANNUALLY
+                            "WEEKLY", "CUSTOM" -> BillingFrequency.CUSTOM
+                            else -> BillingFrequency.MONTHLY
+                        }
+                        val customUnit = if (upperHint == "WEEKLY") "DAYS" else "MONTHS"
+                        val customCount = if (upperHint == "WEEKLY") 7 else result.tenureOrIntervalCount.coerceAtLeast(1)
+                        val subName = result.entityName.ifBlank { "Subscription" }
+                        fun stageSubscriptionPreview(costPaise: Long): String {
+                            val today = IndianFinancialYear.todayEpochDay()
+                            val nextRen = IndianFinancialYear.advanceSubscriptionRenewalEpochDay(
+                                fromEpochDay = today,
+                                frequency = freq,
+                                customIntervalUnit = customUnit,
+                                customIntervalCount = customCount
+                            )
+                            val defaultAcc = currentState.accountsWithBalances.firstOrNull { !it.account.isArchived }?.account
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.EXPENSE,
+                                dateEpochDay = nextRen,
+                                amountPaise = costPaise,
+                                sourceAccountId = defaultAcc?.id,
+                                sourceAccountName = defaultAcc?.name.orEmpty(),
+                                category = "Subscription (${freq.displayName})",
+                                description = "Add Subscription: $subName",
+                                isDemo = isDemo,
+                                operationType = "ADD_SUBSCRIPTION",
+                                operationTitle = "Confirm Subscription",
+                                customCommitAction = {
+                                    val subId = repository.addSubscription(
+                                        name = subName,
+                                        costPaise = costPaise,
+                                        billingFrequency = freq,
+                                        nextRenewalEpochDay = nextRen,
+                                        paymentAccountId = defaultAcc?.id,
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo,
+                                        customIntervalUnit = customUnit,
+                                        customIntervalCount = customCount
+                                    )
+                                    lastUndoableVoiceAction = UndoableVoiceAction.CreatedSubscription(subId, subName)
+                                    "Confirmed and added $subName subscription for ${InrMoney.formatPaise(costPaise)}."
+                                }
+                            )
+                            return "Prepared $subName subscription for ${InrMoney.formatPaise(costPaise)} (${freq.displayName}). Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Amount for $subName",
+                                questionPrompt = "How much is the $subName subscription in rupees?",
+                                quickAmountsPaise = listOf(199_00L, 299_00L, 499_00L, 649_00L, 1_499_00L),
+                                onAmountProvided = { amt -> stageSubscriptionPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageSubscriptionPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "PAY_SUBSCRIPTION" -> {
+                        val subs = currentState.subscriptions
+                        val matched = subs.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
+                        }
+                        val (previewAccId, previewAccName) = resolveAccountCandidateForPreview(result.accountHint, currentState)
+                        fun stagePaySubscription(sub: SubscriptionEntity): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.EXPENSE,
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = sub.costPaise,
+                                sourceAccountId = sub.paymentAccountId ?: previewAccId,
+                                sourceAccountName = previewAccName,
+                                category = "Subscription & Renewals",
+                                description = "Subscription Renewal: ${sub.name}",
+                                isDemo = isDemo,
+                                operationType = "PAY_SUBSCRIPTION",
+                                operationTitle = "Confirm Subscription Payment",
+                                customCommitAction = {
+                                    val accId = sub.paymentAccountId
+                                        ?: previewAccId
+                                        ?: repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo).id
+                                    repository.recordSubscriptionPaymentNow(sub.id, accId)
+                                    "Confirmed payment of ${InrMoney.formatPaise(sub.costPaise)} for ${sub.name}."
+                                }
+                            )
+                            return "Prepared subscription payment of ${InrMoney.formatPaise(sub.costPaise)} for ${sub.name}. Please confirm on screen or say Confirm."
+                        }
+                        if (subs.isEmpty()) {
+                            finalSpokenReply = "You have no active subscriptions to pay."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stagePaySubscription(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else subs
+                            val options = candidates.take(5).mapIndexed { idx, sub ->
+                                VoiceDisambiguationOption(
+                                    index = idx + 1,
+                                    label = sub.name,
+                                    subtitle = "${InrMoney.formatPaise(sub.costPaise)} • ${sub.cycleLabel()}",
+                                    entityId = sub.id
+                                )
+                            }
+                            val q = "Which subscription would you like to pay: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Subscription to Pay",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val sub = uiState.value.subscriptions.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Subscription not found.")
+                                    stagePaySubscription(sub)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
+                        }
+                    }
+
+                    "DELETE_SUBSCRIPTION" -> {
+                        val subs = currentState.subscriptions
+                        val matched = subs.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
+                        }
+                        fun stageDeleteSubscription(sub: SubscriptionEntity): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = sub.nextRenewalEpochDay,
+                                amountPaise = sub.costPaise,
+                                category = sub.cycleLabel(),
+                                description = "Delete Subscription: ${sub.name}",
+                                isDemo = isDemo,
+                                operationType = "DELETE_SUBSCRIPTION",
+                                operationTitle = "Confirm Subscription Deletion",
+                                customCommitAction = {
+                                    repository.deleteSubscription(sub.id)
+                                    lastUndoableVoiceAction = UndoableVoiceAction.DeletedSubscription(sub, sub.name)
+                                    "Confirmed and deleted ${sub.name} subscription. Say Undo to restore it."
+                                }
+                            )
+                            return "Prepared to delete ${sub.name} subscription. Please confirm on screen or say Confirm."
+                        }
+                        if (subs.isEmpty()) {
+                            finalSpokenReply = "You have no active subscriptions to delete."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stageDeleteSubscription(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else subs
+                            val options = candidates.take(5).mapIndexed { idx, sub ->
+                                VoiceDisambiguationOption(idx + 1, sub.name, InrMoney.formatPaise(sub.costPaise), sub.id)
+                            }
+                            val q = "Which subscription should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Subscription to Delete",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val sub = uiState.value.subscriptions.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Subscription not found.")
+                                    stageDeleteSubscription(sub)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
+                        }
+                    }
+
+                    "ADD_INVESTMENT" -> {
+                        val invCat = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
+                            "EQUITY_SHARES", "STOCK", "EQUITY" -> InvestmentCategory.EQUITY_SHARES
+                            "ETF" -> InvestmentCategory.ETF
+                            "SIP" -> InvestmentCategory.SIP
+                            "FIXED_DEPOSIT", "FD" -> InvestmentCategory.FIXED_DEPOSIT
+                            "RECURRING_DEPOSIT", "RD" -> InvestmentCategory.RECURRING_DEPOSIT
+                            "PPF", "NPS", "GOVT_SECURITIES" -> InvestmentCategory.GOVT_SECURITIES
+                            "GOLD" -> InvestmentCategory.GOLD
+                            "SILVER" -> InvestmentCategory.SILVER
+                            "BONDS" -> InvestmentCategory.BONDS
+                            "REAL_ESTATE", "OTHER" -> InvestmentCategory.OTHER
+                            else -> InvestmentCategory.MUTUAL_FUND
+                        }
+                        val invName = result.entityName.ifBlank { "Portfolio Investment" }
+                        val (previewAccId, previewAccName) = resolveAccountCandidateForPreview(result.accountHint, currentState)
+                        fun stageInvestmentPreview(amtPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.INVESTMENT_PURCHASE,
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = amtPaise,
+                                sourceAccountId = previewAccId,
+                                sourceAccountName = previewAccName,
+                                category = invCat.displayName,
+                                description = "Investment in $invName",
+                                isDemo = isDemo,
+                                operationType = "ADD_INVESTMENT",
+                                operationTitle = "Confirm Investment Entry",
+                                customCommitAction = {
+                                    val payAcc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
+                                    repository.addInvestment(
+                                        name = invName,
+                                        category = invCat,
+                                        purchaseDateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                        quantity = 1.0,
+                                        units = 1.0,
+                                        purchasePricePerUnitPaise = amtPaise,
+                                        investedAmountPaise = amtPaise,
+                                        chargesPaise = 0L,
+                                        currentRecordedValuePaise = amtPaise,
+                                        isCurrentValueRecorded = true,
+                                        paymentAccountId = payAcc.id,
+                                        maturityDateEpochDay = null,
+                                        annualInterestRatePercent = result.ratePercent.takeIf { it > 0.0 },
+                                        compoundingFrequency = CompoundingFrequency.ANNUALLY,
+                                        durationMonths = result.tenureOrIntervalCount.takeIf { it > 0 },
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    "Confirmed and recorded investment of ${InrMoney.formatPaise(amtPaise)} in $invName."
+                                }
+                            )
+                            return "Prepared investment of ${InrMoney.formatPaise(amtPaise)} in $invName (${invCat.displayName}). Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Investment Amount for $invName",
+                                questionPrompt = "How much did you invest in $invName? Please say the amount in rupees.",
+                                quickAmountsPaise = listOf(1_000_00L, 5_000_00L, 10_000_00L, 25_000_00L, 50_000_00L),
+                                onAmountProvided = { amt -> stageInvestmentPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageInvestmentPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "ADD_LOAN" -> {
+                        val lType = when (result.frequencyOrTypeHint.uppercase(java.util.Locale.US)) {
+                            "HOME" -> LoanType.HOME
+                            "VEHICLE", "CAR" -> LoanType.VEHICLE
+                            "EDUCATION" -> LoanType.EDUCATION
+                            "GOLD", "CREDIT_CARD", "OTHER" -> LoanType.OTHER
+                            else -> LoanType.PERSONAL
+                        }
+                        val loanName = result.entityName.ifBlank { lType.displayName }
+                        val (previewAccId, previewAccName) = resolveAccountCandidateForPreview(result.accountHint, currentState)
+                        fun stageLoanPreview(principalPaise: Long): String {
+                            val rate = result.ratePercent.coerceAtLeast(0.0)
+                            val tenure = if (result.tenureOrIntervalCount > 0) result.tenureOrIntervalCount else 12
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.LOAN_RECEIVED,
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = principalPaise,
+                                destinationAccountId = previewAccId,
+                                destinationAccountName = previewAccName,
+                                category = lType.displayName,
+                                description = "Add Loan: $loanName (${rate}% for $tenure months)",
+                                isDemo = isDemo,
+                                operationType = "ADD_LOAN",
+                                operationTitle = "Confirm Loan Record",
+                                customCommitAction = {
+                                    val acc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
+                                    repository.addLoan(
+                                        name = loanName,
+                                        loanType = lType,
+                                        lenderName = loanName,
+                                        principalPaise = principalPaise,
+                                        annualInterestRatePercent = rate,
+                                        tenureMonths = tenure,
+                                        startDateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                        disbursedToAccountId = acc.id,
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    "Confirmed and added loan '$loanName' of ${InrMoney.formatPaise(principalPaise)}."
+                                }
+                            )
+                            return "Prepared loan $loanName of ${InrMoney.formatPaise(principalPaise)}. Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Principal Amount for $loanName",
+                                questionPrompt = "What is the loan principal amount in rupees for $loanName?",
+                                quickAmountsPaise = listOf(50_000_00L, 1_00_000_00L, 5_00_000_00L, 10_00_000_00L, 25_00_000_00L),
+                                onAmountProvided = { amt -> stageLoanPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageLoanPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "PAY_LOAN_EMI" -> {
+                        val activeLoans = currentState.loans.filter { !it.isClosed }
+                        val matched = activeLoans.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
+                        }
+                        val (previewAccId, previewAccName) = resolveAccountCandidateForPreview(result.accountHint, currentState)
+                        fun stageLoanEmiPreview(loan: LoanEntity): String {
+                            val emiPaise = loan.emiAmountPaise.coerceAtMost(loan.remainingPrincipalPaise).coerceAtLeast(1L)
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.LOAN_REPAYMENT,
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = emiPaise,
+                                sourceAccountId = previewAccId,
+                                sourceAccountName = previewAccName,
+                                category = "Loan EMI Repayment",
+                                description = "EMI Repayment for ${loan.name}",
+                                isDemo = isDemo,
+                                operationType = "PAY_LOAN_EMI",
+                                operationTitle = "Confirm Loan EMI Payment",
+                                customCommitAction = {
+                                    val srcAcc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
+                                    repository.recordTransaction(
+                                        transactionType = TransactionType.LOAN_REPAYMENT,
+                                        dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                        amountPaise = emiPaise,
+                                        principalComponentPaise = emiPaise,
+                                        interestComponentPaise = 0L,
+                                        sourceAccountId = srcAcc.id,
+                                        category = "Loan EMI Repayment",
+                                        description = "EMI Repayment for ${loan.name}",
+                                        linkedLoanId = loan.id,
+                                        isDemo = isDemo
+                                    )
+                                    "Confirmed EMI payment of ${InrMoney.formatPaise(emiPaise)} for ${loan.name}."
+                                }
+                            )
+                            return "Prepared EMI payment of ${InrMoney.formatPaise(emiPaise)} for ${loan.name}. Please confirm on screen or say Confirm."
+                        }
+                        if (activeLoans.isEmpty()) {
+                            finalSpokenReply = "You have no active loans for EMI repayment."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stageLoanEmiPreview(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else activeLoans
+                            val options = candidates.take(5).mapIndexed { idx, l ->
+                                VoiceDisambiguationOption(
+                                    index = idx + 1,
+                                    label = l.name,
+                                    subtitle = "EMI: ${InrMoney.formatPaise(l.emiAmountPaise)}",
+                                    entityId = l.id
+                                )
+                            }
+                            val q = "Which loan EMI would you like to pay: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Loan EMI to Pay",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val loan = uiState.value.loans.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Loan not found.")
+                                    stageLoanEmiPreview(loan)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
+                        }
+                    }
+
+                    "ADD_BUDGET" -> {
+                        val cat = result.categoryOrScope.ifBlank { "OVERALL" }
+                        val bName = result.entityName.ifBlank { if (cat == "OVERALL") "Overall Monthly Budget" else "$cat Budget" }
+                        fun stageBudgetPreview(limitPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = limitPaise,
+                                category = cat,
+                                description = "Set Budget: $bName",
+                                isDemo = isDemo,
+                                operationType = "ADD_BUDGET",
+                                operationTitle = "Confirm Monthly Budget",
+                                customCommitAction = {
+                                    val budgetId = repository.addBudget(
+                                        name = bName,
+                                        budgetPeriod = BudgetPeriod.MONTHLY,
+                                        category = cat,
+                                        limitPaise = limitPaise,
+                                        financialYear = uiState.value.settings.activeFinancialYear,
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    lastUndoableVoiceAction = UndoableVoiceAction.CreatedBudget(budgetId, bName)
+                                    "Confirmed and saved $bName of ${InrMoney.formatPaise(limitPaise)}."
+                                }
+                            )
+                            return "Prepared $bName with limit ${InrMoney.formatPaise(limitPaise)}. Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Limit for $bName",
+                                questionPrompt = "What is the monthly limit in rupees for $bName?",
+                                quickAmountsPaise = listOf(5_000_00L, 10_000_00L, 15_000_00L, 25_000_00L, 50_000_00L),
+                                onAmountProvided = { amt -> stageBudgetPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageBudgetPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "DELETE_BUDGET" -> {
+                        val budgets = currentState.budgets
+                        val matched = budgets.filter {
+                            result.entityName.isNotBlank() && (
+                                it.name.contains(result.entityName, ignoreCase = true) ||
+                                    it.category.contains(result.entityName, ignoreCase = true)
+                                )
+                        }
+                        fun stageDeleteBudget(b: BudgetEntity): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = b.limitPaise,
+                                category = b.category,
+                                description = "Delete Budget: ${b.name}",
+                                isDemo = isDemo,
+                                operationType = "DELETE_BUDGET",
+                                operationTitle = "Confirm Budget Deletion",
+                                customCommitAction = {
+                                    repository.deleteBudget(b.id)
                                     lastUndoableVoiceAction = UndoableVoiceAction.DeletedBudget(b, b.name)
+                                    "Confirmed and deleted ${b.name}. Say Undo to restore it."
                                 }
-                                repository.deleteBudget(chosen.entityId)
-                                "Deleted ${chosen.label}. Say Undo to restore it."
-                            }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    }
-                }
-
-                "ADD_GOAL" -> {
-                    val target = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val goalName = result.entityName.ifBlank { "Savings Goal" }
-                    val goalId = repository.addGoal(
-                        name = goalName,
-                        goalType = GoalType.SAVINGS,
-                        targetAmountPaise = target,
-                        currentSavedPaise = result.secondaryAmountPaise,
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                    lastUndoableVoiceAction = UndoableVoiceAction.CreatedGoal(goalId, goalName)
-                }
-
-                "DELETE_GOAL" -> {
-                    val goals = currentState.goals
-                    val matched = goals.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    if (goals.isEmpty()) {
-                        finalSpokenReply = "You have no savings goals to delete."
-                    } else if (matched.size == 1 || (goals.size == 1 && result.entityName.isBlank())) {
-                        val g = matched.firstOrNull() ?: goals.first()
-                        repository.deleteGoal(g.id)
-                        lastUndoableVoiceAction = UndoableVoiceAction.DeletedGoal(g, g.name)
-                        finalSpokenReply = "Deleted savings goal ${g.name}. Say Undo to restore it."
-                    } else {
-                        val candidates = if (matched.isNotEmpty()) matched else goals
-                        val options = candidates.take(5).mapIndexed { idx, g ->
-                            VoiceDisambiguationOption(
-                                idx + 1,
-                                g.name,
-                                "${InrMoney.formatPaise(g.currentSavedPaise)} / ${InrMoney.formatPaise(g.targetAmountPaise)}",
-                                g.id
                             )
+                            return "Prepared to delete budget ${b.name}. Please confirm on screen or say Confirm."
                         }
-                        val q = "Which savings goal should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Savings Goal to Delete",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                val g = currentState.goals.firstOrNull { it.id == chosen.entityId }
-                                if (g != null) {
+                        if (budgets.isEmpty()) {
+                            finalSpokenReply = "You have no active budgets to delete."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stageDeleteBudget(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else budgets
+                            val options = candidates.take(5).mapIndexed { idx, b ->
+                                VoiceDisambiguationOption(idx + 1, b.name, InrMoney.formatPaise(b.limitPaise), b.id)
+                            }
+                            val q = "Which budget should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Budget to Delete",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val b = uiState.value.budgets.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Budget not found.")
+                                    stageDeleteBudget(b)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
+                        }
+                    }
+
+                    "ADD_GOAL" -> {
+                        val goalName = result.entityName.ifBlank { "Savings Goal" }
+                        fun stageGoalPreview(targetPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = targetPaise,
+                                category = GoalType.SAVINGS.displayName,
+                                description = "Create Goal: $goalName",
+                                isDemo = isDemo,
+                                operationType = "ADD_GOAL",
+                                operationTitle = "Confirm Savings Goal",
+                                customCommitAction = {
+                                    val goalId = repository.addGoal(
+                                        name = goalName,
+                                        goalType = GoalType.SAVINGS,
+                                        targetAmountPaise = targetPaise,
+                                        currentSavedPaise = result.secondaryAmountPaise.coerceAtLeast(0L),
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    lastUndoableVoiceAction = UndoableVoiceAction.CreatedGoal(goalId, goalName)
+                                    "Confirmed and created savings goal '$goalName' with target ${InrMoney.formatPaise(targetPaise)}."
+                                }
+                            )
+                            return "Prepared savings goal $goalName with target ${InrMoney.formatPaise(targetPaise)}. Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Target Amount for $goalName",
+                                questionPrompt = "What is the target amount in rupees for your $goalName goal?",
+                                quickAmountsPaise = listOf(10_000_00L, 25_000_00L, 50_000_00L, 1_00_000_00L, 5_00_000_00L),
+                                onAmountProvided = { amt -> stageGoalPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageGoalPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "DELETE_GOAL" -> {
+                        val goals = currentState.goals
+                        val matched = goals.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
+                        }
+                        fun stageDeleteGoal(g: GoalEntity): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = g.targetAmountPaise,
+                                category = g.goalType.displayName,
+                                description = "Delete Goal: ${g.name}",
+                                isDemo = isDemo,
+                                operationType = "DELETE_GOAL",
+                                operationTitle = "Confirm Goal Deletion",
+                                customCommitAction = {
+                                    repository.deleteGoal(g.id)
                                     lastUndoableVoiceAction = UndoableVoiceAction.DeletedGoal(g, g.name)
+                                    "Confirmed and deleted savings goal ${g.name}. Say Undo to restore it."
                                 }
-                                repository.deleteGoal(chosen.entityId)
-                                "Deleted savings goal ${chosen.label}. Say Undo to restore it."
-                            }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    }
-                }
-
-                "CONTRIBUTE_GOAL" -> {
-                    val goals = currentState.goals
-                    val matched = goals.filter {
-                        result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
-                    }
-                    val amt = result.primaryAmountPaise.coerceAtLeast(1000L)
-                    if (matched.size == 1 || (goals.size == 1 && result.entityName.isBlank())) {
-                        val g = matched.firstOrNull() ?: goals.first()
-                        repository.contributeToGoal(g.id, amt)
-                        finalSpokenReply = "Added ${InrMoney.formatPaise(amt)} towards your ${g.name} goal."
-                    } else if (goals.size > 1) {
-                        val options = goals.take(5).mapIndexed { idx, g ->
-                            VoiceDisambiguationOption(
-                                index = idx + 1,
-                                label = g.name,
-                                subtitle = "${InrMoney.formatPaise(g.currentSavedPaise)} / ${InrMoney.formatPaise(g.targetAmountPaise)}",
-                                entityId = g.id
                             )
+                            return "Prepared to delete savings goal ${g.name}. Please confirm on screen or say Confirm."
                         }
-                        val q = "Which savings goal should I add ${InrMoney.formatPaise(amt)} to: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
-                        _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
-                            title = "Select Goal for ${InrMoney.formatPaise(amt)}",
-                            questionPrompt = q,
-                            options = options,
-                            onSelectOption = { chosen ->
-                                repository.contributeToGoal(chosen.entityId, amt)
-                                "Added ${InrMoney.formatPaise(amt)} towards ${chosen.label}."
+                        if (goals.isEmpty()) {
+                            finalSpokenReply = "You have no savings goals to delete."
+                        } else if (matched.size == 1) {
+                            finalSpokenReply = stageDeleteGoal(matched.first())
+                        } else {
+                            val candidates = if (matched.isNotEmpty()) matched else goals
+                            val options = candidates.take(5).mapIndexed { idx, g ->
+                                VoiceDisambiguationOption(
+                                    idx + 1,
+                                    g.name,
+                                    "${InrMoney.formatPaise(g.currentSavedPaise)} / ${InrMoney.formatPaise(g.targetAmountPaise)}",
+                                    g.id
+                                )
                             }
-                        )
-                        finalSpokenReply = q
-                        listenForFollowUp = true
-                    } else {
-                        finalSpokenReply = "You have no savings goals yet. Say Create a savings goal first."
-                    }
-                }
-
-                "ADD_GIFT_CARD" -> {
-                    val valPaise = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val brand = result.entityName.ifBlank { "Gift Card" }
-                    repository.addGiftCard(
-                        brand = brand,
-                        name = "$brand Voucher",
-                        initialValuePaise = valPaise,
-                        remainingValuePaise = valPaise,
-                        purchaseDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        cardNumberRaw = "XXXX-1001",
-                        redemptionPinRaw = "0000",
-                        purchasedFromAccountId = null,
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                }
-
-                "ADD_TAX_RECORD" -> {
-                    val amt = result.primaryAmountPaise.coerceAtLeast(10000L)
-                    val acc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
-                    repository.addTaxRecord(
-                        taxType = TaxType.ADVANCE_TAX,
-                        financialYear = currentState.settings.activeFinancialYear,
-                        amountPaidPaise = amt,
-                        paymentDateEpochDay = IndianFinancialYear.todayEpochDay(),
-                        challanNumber = result.entityName.ifBlank { "VOICE-TAX" },
-                        paymentAccountId = acc.id,
-                        supportingDocLabel = "Voice Entry",
-                        notes = "Added via Voice Command",
-                        isDemo = isDemo
-                    )
-                }
-
-                "SEARCH" -> {
-                    val q = result.searchQuery.trim()
-                    if (q.isNotBlank()) {
-                        updateSearchQuery(q)
-                        commitSearchQuery(q)
-                        collapseSearchBar()
-                    }
-                }
-
-                "CLEAR_SEARCH" -> {
-                    closeAndResetSearch()
-                }
-
-                "EXPORT_REPORT" -> {
-                    when (result.exportFormat.uppercase(java.util.Locale.US)) {
-                        "PDF" -> preparePdfExport(context)
-                        "EXCEL" -> prepareCsvOrExcelExport(context, asExcel = true)
-                        "CSV" -> prepareCsvOrExcelExport(context, asExcel = false)
-                        "JSON" -> prepareJsonBackupExport(context)
-                        else -> preparePdfExport(context)
-                    }
-                }
-
-                "UPDATE_SETTING" -> {
-                    when (result.settingKey.uppercase(java.util.Locale.US)) {
-                        "PRIVACY_MODE" -> {
-                            val enable = result.settingValue.equals("ON", ignoreCase = true)
-                            repository.togglePrivacyMode(enable)
+                            val q = "Which savings goal should I delete: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Savings Goal to Delete",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val g = uiState.value.goals.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Goal not found.")
+                                    stageDeleteGoal(g)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
                         }
-                        "THEME_MODE" -> {
-                            val mode = when (result.settingValue.uppercase(java.util.Locale.US)) {
-                                "LIGHT" -> ThemeMode.LIGHT
-                                "SYSTEM" -> ThemeMode.SYSTEM
-                                else -> ThemeMode.DARK
+                    }
+
+                    "CONTRIBUTE_GOAL" -> {
+                        val goals = currentState.goals
+                        val matched = goals.filter {
+                            result.entityName.isNotBlank() && it.name.contains(result.entityName, ignoreCase = true)
+                        }
+                        fun stageGoalContribution(g: GoalEntity, amtPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = amtPaise,
+                                destinationAccountName = g.name,
+                                category = g.goalType.displayName,
+                                description = "Contribute to Goal: ${g.name}",
+                                isDemo = isDemo,
+                                operationType = "CONTRIBUTE_GOAL",
+                                operationTitle = "Confirm Goal Contribution",
+                                customCommitAction = {
+                                    repository.contributeToGoal(g.id, amtPaise)
+                                    "Confirmed and added ${InrMoney.formatPaise(amtPaise)} towards your ${g.name} goal."
+                                }
+                            )
+                            return "Prepared contribution of ${InrMoney.formatPaise(amtPaise)} towards ${g.name}. Please confirm on screen or say Confirm."
+                        }
+                        if (goals.isEmpty()) {
+                            finalSpokenReply = "You have no savings goals yet. Say Create a savings goal first."
+                        } else if (result.primaryAmountPaise <= 0L) {
+                            val targetGoal = matched.firstOrNull() ?: goals.first()
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Contribution for ${targetGoal.name}",
+                                questionPrompt = "How much in rupees would you like to add towards ${targetGoal.name}?",
+                                quickAmountsPaise = listOf(500_00L, 1_000_00L, 2_500_00L, 5_000_00L, 10_000_00L),
+                                onAmountProvided = { amt -> stageGoalContribution(targetGoal, amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else if (matched.size == 1 || (goals.size == 1 && result.entityName.isBlank())) {
+                            val g = matched.firstOrNull() ?: goals.first()
+                            finalSpokenReply = stageGoalContribution(g, result.primaryAmountPaise)
+                        } else {
+                            val amt = result.primaryAmountPaise
+                            val options = goals.take(5).mapIndexed { idx, g ->
+                                VoiceDisambiguationOption(
+                                    index = idx + 1,
+                                    label = g.name,
+                                    subtitle = "${InrMoney.formatPaise(g.currentSavedPaise)} / ${InrMoney.formatPaise(g.targetAmountPaise)}",
+                                    entityId = g.id
+                                )
                             }
-                            repository.updateThemeMode(mode)
+                            val q = "Which savings goal should I add ${InrMoney.formatPaise(amt)} to: ${options.joinToString(", or ") { "${it.index}. ${it.label}" }}?"
+                            _pendingVoiceDisambiguation.value = PendingVoiceDisambiguation(
+                                title = "Select Goal for ${InrMoney.formatPaise(amt)}",
+                                questionPrompt = q,
+                                options = options,
+                                onSelectOption = { chosen ->
+                                    val g = uiState.value.goals.firstOrNull { it.id == chosen.entityId }
+                                        ?: throw IllegalArgumentException("Goal not found.")
+                                    stageGoalContribution(g, amt)
+                                }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = true
                         }
-                        "DEMO_MODE" -> {
-                            val enable = result.settingValue.equals("ON", ignoreCase = true)
-                            repository.setDemonstrationMode(enable)
+                    }
+
+                    "ADD_GIFT_CARD" -> {
+                        val brand = result.entityName.ifBlank { "Gift Card" }
+                        fun stageGiftCardPreview(valPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = valPaise,
+                                destinationAccountName = "$brand Voucher",
+                                category = "Gift Card",
+                                description = "Add $brand Gift Card",
+                                isDemo = isDemo,
+                                operationType = "ADD_GIFT_CARD",
+                                operationTitle = "Confirm Gift Card",
+                                customCommitAction = {
+                                    repository.addGiftCard(
+                                        brand = brand,
+                                        name = "$brand Voucher",
+                                        initialValuePaise = valPaise,
+                                        remainingValuePaise = valPaise,
+                                        purchaseDateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                        cardNumberRaw = "XXXX-1001",
+                                        redemptionPinRaw = "0000",
+                                        purchasedFromAccountId = null,
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    "Confirmed and added $brand gift card worth ${InrMoney.formatPaise(valPaise)}."
+                                }
+                            )
+                            return "Prepared $brand gift card worth ${InrMoney.formatPaise(valPaise)}. Please confirm on screen or say Confirm."
                         }
-                        "LOCK_APP" -> {
-                            lockAppNow()
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Value for $brand Gift Card",
+                                questionPrompt = "What is the value in rupees of the $brand gift card?",
+                                quickAmountsPaise = listOf(500_00L, 1_000_00L, 2_000_00L, 5_000_00L, 10_000_00L),
+                                onAmountProvided = { amt -> stageGiftCardPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageGiftCardPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "ADD_TAX_RECORD" -> {
+                        val challanRef = result.entityName.ifBlank { "VOICE-TAX" }
+                        val (previewAccId, previewAccName) = resolveAccountCandidateForPreview(result.accountHint, currentState)
+                        fun stageTaxRecordPreview(amtPaise: Long): String {
+                            _pendingAiConfirmation.value = PendingAiTransactionConfirmation(
+                                transactionType = TransactionType.TAX_PAYMENT,
+                                dateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                amountPaise = amtPaise,
+                                sourceAccountId = previewAccId,
+                                sourceAccountName = previewAccName,
+                                category = TaxType.ADVANCE_TAX.displayName,
+                                description = "Tax Record ($challanRef)",
+                                isDemo = isDemo,
+                                operationType = "ADD_TAX_RECORD",
+                                operationTitle = "Confirm Tax Record",
+                                customCommitAction = {
+                                    val acc = repository.resolveOrCreateAccountForVoice(result.accountHint, isDemo)
+                                    repository.addTaxRecord(
+                                        taxType = TaxType.ADVANCE_TAX,
+                                        financialYear = uiState.value.settings.activeFinancialYear,
+                                        amountPaidPaise = amtPaise,
+                                        paymentDateEpochDay = IndianFinancialYear.todayEpochDay(),
+                                        challanNumber = challanRef,
+                                        paymentAccountId = acc.id,
+                                        supportingDocLabel = "Voice Entry",
+                                        notes = "Added via Voice Command",
+                                        isDemo = isDemo
+                                    )
+                                    "Confirmed and recorded tax payment of ${InrMoney.formatPaise(amtPaise)}."
+                                }
+                            )
+                            return "Prepared tax record of ${InrMoney.formatPaise(amtPaise)} from $previewAccName. Please confirm on screen or say Confirm."
+                        }
+                        if (result.primaryAmountPaise <= 0L) {
+                            val (q, followUp) = promptForMissingVoiceAmount(
+                                title = "Enter Tax Payment Amount",
+                                questionPrompt = "How much tax was paid in rupees?",
+                                quickAmountsPaise = listOf(2_500_00L, 5_000_00L, 10_000_00L, 25_000_00L, 50_000_00L),
+                                onAmountProvided = { amt -> stageTaxRecordPreview(amt) }
+                            )
+                            finalSpokenReply = q
+                            listenForFollowUp = followUp
+                        } else {
+                            finalSpokenReply = stageTaxRecordPreview(result.primaryAmountPaise)
+                        }
+                    }
+
+                    "SEARCH" -> {
+                        val q = result.searchQuery.trim()
+                        if (q.isNotBlank()) {
+                            updateSearchQuery(q)
+                            commitSearchQuery(q)
+                            collapseSearchBar()
+                        }
+                    }
+
+                    "CLEAR_SEARCH" -> {
+                        closeAndResetSearch()
+                    }
+
+                    "EXPORT_REPORT" -> {
+                        when (result.exportFormat.uppercase(java.util.Locale.US)) {
+                            "PDF" -> preparePdfExport(context)
+                            "EXCEL" -> prepareCsvOrExcelExport(context, asExcel = true)
+                            "CSV" -> prepareCsvOrExcelExport(context, asExcel = false)
+                            "JSON" -> prepareJsonBackupExport(context)
+                            else -> preparePdfExport(context)
+                        }
+                    }
+
+                    "UPDATE_SETTING" -> {
+                        when (result.settingKey.uppercase(java.util.Locale.US)) {
+                            "PRIVACY_MODE" -> {
+                                val enable = result.settingValue.equals("ON", ignoreCase = true)
+                                repository.togglePrivacyMode(enable)
+                            }
+                            "THEME_MODE" -> {
+                                val mode = when (result.settingValue.uppercase(java.util.Locale.US)) {
+                                    "LIGHT" -> ThemeMode.LIGHT
+                                    "SYSTEM" -> ThemeMode.SYSTEM
+                                    else -> ThemeMode.DARK
+                                }
+                                repository.updateThemeMode(mode)
+                            }
+                            "DEMO_MODE" -> {
+                                val enable = result.settingValue.equals("ON", ignoreCase = true)
+                                repository.setDemonstrationMode(enable)
+                            }
+                            "LOCK_APP" -> {
+                                lockAppNow()
+                            }
                         }
                     }
                 }
-            }
 
                 val updatedState = uiState.value
                 val totalBalPaise = updatedState.accountsWithBalances
@@ -2800,8 +3281,21 @@ class FinanceVaultViewModel(
         }
     }
 
+    fun setLocationTaggingEnabled(enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setLocationTaggingEnabled(enabled)
+            _statusBannerMessage.value = if (enabled) {
+                "Optional GPS location tagging enabled for transactions."
+            } else {
+                "GPS location tagging disabled (opt-in privacy mode)."
+            }
+        }
+    }
+
     fun unlockWithBiometrics() {
         _pinLockoutErrorMessage.value = null
+        lastUserInteractionMillis.set(System.currentTimeMillis())
+        backgroundEnteredAtMillis.set(0L)
         _isPinUnlockedSession.value = true
         viewModelScope.launch(Dispatchers.IO) {
             repository.resetPinLockoutOnBiometricSuccess()
@@ -2875,26 +3369,50 @@ class FinanceVaultViewModel(
         }
     }
 
-    fun prepareJsonBackupExport(context: Context) {
+    fun prepareJsonBackupExport(context: Context, password: String? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                val json = repository.createJsonBackupString()
+                val json = repository.createJsonBackupString(password)
                 DocumentExporter.exportJsonBackupFile(context, json)
             }.onSuccess { res ->
                 _exportPreviewResult.value = res
-                _statusBannerMessage.value = "Downloaded JSON Backup: ${res.downloadedLocationLabel}"
+                val encNote = if (!password.isNullOrBlank()) " (AES-256-GCM encrypted)" else ""
+                _statusBannerMessage.value = "Downloaded JSON Backup$encNote: ${res.downloadedLocationLabel}"
             }.onFailure { e ->
                 _statusBannerMessage.value = "Could not export JSON backup: ${e.message}"
             }
         }
     }
 
-    fun restoreFromJsonBackup(jsonText: String) {
+    fun inspectBackupBeforeRestore(jsonText: String, password: String? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                repository.restoreFromJsonBackup(jsonText)
+                repository.inspectJsonBackup(jsonText, password)
+            }.onSuccess { preview ->
+                _pendingBackupRestorePreview.value = preview
+            }.onFailure { e ->
+                _pendingBackupRestorePreview.value = null
+                _statusBannerMessage.value = "Backup validation failed: ${e.message}"
+            }
+        }
+    }
+
+    fun dismissBackupRestorePreview() {
+        _pendingBackupRestorePreview.value = null
+    }
+
+    fun restoreFromJsonBackup(
+        jsonText: String,
+        password: String? = null,
+        mode: com.example.data.repository.BackupRestoreMode = com.example.data.repository.BackupRestoreMode.MERGE_KEEP_EXISTING
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                repository.restoreFromJsonBackup(jsonText, password, mode)
             }.onSuccess { count ->
-                _statusBannerMessage.value = "Restored $count account(s) from JSON backup."
+                _pendingBackupRestorePreview.value = null
+                val modeLabel = if (mode == com.example.data.repository.BackupRestoreMode.REPLACE_EXISTING) "Replaced vault with" else "Merged"
+                _statusBannerMessage.value = "$modeLabel $count record(s) from JSON backup."
             }.onFailure { e ->
                 _statusBannerMessage.value = "Restore failed: ${e.message}"
             }

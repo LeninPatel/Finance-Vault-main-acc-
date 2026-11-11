@@ -45,8 +45,8 @@ data class GeminiAssistantResult(
     val entityName: String = "",
     val primaryAmountPaise: Long = 0L,
     val secondaryAmountPaise: Long = 0L,
-    val ratePercent: Double = 8.5,
-    val tenureOrIntervalCount: Int = 1,
+    val ratePercent: Double = 0.0,
+    val tenureOrIntervalCount: Int = 0,
     val frequencyOrTypeHint: String = "",
     val categoryOrScope: String = "",
     val accountHint: String = "",
@@ -253,8 +253,8 @@ object GeminiVaultAssistant {
             val amountPaise = (amountRupees * 100.0).toLong()
             val secondaryRupees = json.optDouble("secondaryAmountInRupees", 0.0)
             val secondaryPaise = (secondaryRupees * 100.0).toLong()
-            val ratePercent = json.optDouble("ratePercent", 8.5)
-            val tenureCount = json.optInt("tenureOrIntervalCount", 1).coerceAtLeast(1)
+            val ratePercent = json.optDouble("ratePercent", 0.0)
+            val tenureCount = json.optInt("tenureOrIntervalCount", 0).coerceAtLeast(0)
             val entityName = json.optString("entityName", "").trim()
             val freqOrType = json.optString("frequencyOrTypeHint", "").trim()
             val txTypeRaw = json.optString("transactionType", "EXPENSE")
@@ -665,7 +665,7 @@ object GeminiVaultAssistant {
                     spokenReply = if (subName.isNotBlank()) "Recording payment for $subName subscription." else "Checking subscription to pay."
                 )
             }
-            if ((lower.contains("add") || lower.contains("create") || lower.contains("new")) && amountPaise > 0L) {
+            if (lower.contains("add") || lower.contains("create") || lower.contains("new")) {
                 val freq = when {
                     lower.contains("two month") || lower.contains("2 month") || lower.contains("bimonthly") -> "BIMONTHLY"
                     lower.contains("four month") || lower.contains("4 month") -> "FOUR_MONTHLY"
@@ -684,16 +684,17 @@ object GeminiVaultAssistant {
                     frequencyOrTypeHint = freq,
                     targetTab = MainTab.MORE,
                     targetMore = MoreDestination.SUBSCRIPTIONS,
-                    spokenReply = "Added $subName subscription for ${InrMoney.formatPaise(amountPaise)} ($freq)."
+                    spokenReply = if (amountPaise > 0L) {
+                        "Prepared $subName subscription for ${InrMoney.formatPaise(amountPaise)} ($freq)."
+                    } else {
+                        "How much is the $subName subscription?"
+                    }
                 )
             }
         }
 
-        // 5c. Add Investment by Voice (e.g. "Invest 15000 in Nifty 50 Index Fund" or "Add investment of 10000 in Gold")
-        if (
-            (lower.startsWith("invest ") || ((lower.contains("add") || lower.contains("record")) && lower.contains("investment"))) &&
-            amountPaise > 0L
-        ) {
+        // 5c. Add Investment by Voice (e.g. "Invest 15000 in Nifty 50 Index Fund" or "Add investment in Gold")
+        if (lower.startsWith("invest ") || ((lower.contains("add") || lower.contains("record")) && lower.contains("investment"))) {
             val invCat = when {
                 lower.contains("stock") || lower.contains("equity") || lower.contains("share") -> "EQUITY_SHARES"
                 lower.contains("fd") || lower.contains("fixed deposit") -> "FIXED_DEPOSIT"
@@ -707,18 +708,31 @@ object GeminiVaultAssistant {
             }
             val inRegex = Regex("""\b(?:in|into|for)\s+([A-Za-z0-9][A-Za-z0-9 &.-]{1,30}?)(?=\s+(?:from|using|with|at|for|\d)|$)""", RegexOption.IGNORE_CASE)
             val invName = inRegex.find(cleaned)?.groupValues?.getOrNull(1)?.trim().orEmpty().ifBlank { "Portfolio Investment" }
+            val rateMatch = Regex("""(\d+(?:\.\d+)?)\s*(?:%|percent)""", RegexOption.IGNORE_CASE).find(cleaned)
+            val rate = rateMatch?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+            val monthsMatch = Regex("""(\d+)\s*months?""", RegexOption.IGNORE_CASE).find(cleaned)
+            val yearsMatch = Regex("""(\d+)\s*years?""", RegexOption.IGNORE_CASE).find(cleaned)
+            val tenure = monthsMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: (yearsMatch?.groupValues?.getOrNull(1)?.toIntOrNull()?.times(12))
+                ?: 0
             return GeminiAssistantResult(
                 action = "ADD_INVESTMENT",
                 entityName = invName,
                 primaryAmountPaise = amountPaise,
+                ratePercent = rate,
+                tenureOrIntervalCount = tenure,
                 frequencyOrTypeHint = invCat,
                 targetTab = MainTab.INVESTMENTS,
-                spokenReply = "Recorded investment of ${InrMoney.formatPaise(amountPaise)} in $invName."
+                spokenReply = if (amountPaise > 0L) {
+                    "Prepared investment of ${InrMoney.formatPaise(amountPaise)} in $invName."
+                } else {
+                    "How much would you like to invest in $invName?"
+                }
             )
         }
 
         // 5d. Add Budget or Savings Goal by Voice
-        if (lower.contains("budget") && (lower.contains("set") || lower.contains("add") || lower.contains("create")) && amountPaise > 0L) {
+        if (lower.contains("budget") && (lower.contains("set") || lower.contains("add") || lower.contains("create"))) {
             val isOverall = lower.contains("overall") || lower.contains("total")
             val cat = if (isOverall) "OVERALL" else inferCategoryFromEnglish(lower, TransactionType.EXPENSE, uiState.customOptionsMap["TX_CATEGORY"].orEmpty())
             return GeminiAssistantResult(
@@ -728,11 +742,15 @@ object GeminiVaultAssistant {
                 categoryOrScope = cat,
                 targetTab = MainTab.MORE,
                 targetMore = MoreDestination.BUDGETS_GOALS,
-                spokenReply = "Set ${if (isOverall) "overall monthly" else cat} budget to ${InrMoney.formatPaise(amountPaise)}."
+                spokenReply = if (amountPaise > 0L) {
+                    "Prepared ${if (isOverall) "overall monthly" else cat} budget of ${InrMoney.formatPaise(amountPaise)}."
+                } else {
+                    "What is the limit amount for your ${if (isOverall) "overall monthly" else cat} budget?"
+                }
             )
         }
 
-        if (lower.contains("goal") && amountPaise > 0L) {
+        if (lower.contains("goal")) {
             if (lower.contains("contribute") || (lower.contains("add") && lower.contains("to ") && !lower.contains("create") && !lower.contains("new"))) {
                 val goalName = extractEntityNameAfterKeyword(cleaned, listOf("to", "towards", "into"), "goal")
                 return GeminiAssistantResult(
@@ -741,7 +759,11 @@ object GeminiVaultAssistant {
                     primaryAmountPaise = amountPaise,
                     targetTab = MainTab.MORE,
                     targetMore = MoreDestination.BUDGETS_GOALS,
-                    spokenReply = "Added ${InrMoney.formatPaise(amountPaise)} towards your ${goalName.ifBlank { "savings" }} goal."
+                    spokenReply = if (amountPaise > 0L) {
+                        "Prepared contribution of ${InrMoney.formatPaise(amountPaise)} towards your ${goalName.ifBlank { "savings" }} goal."
+                    } else {
+                        "How much would you like to contribute towards your ${goalName.ifBlank { "savings" }} goal?"
+                    }
                 )
             }
             if (lower.contains("create") || lower.contains("add") || lower.contains("set") || lower.contains("new")) {
@@ -753,13 +775,17 @@ object GeminiVaultAssistant {
                     primaryAmountPaise = amountPaise,
                     targetTab = MainTab.MORE,
                     targetMore = MoreDestination.BUDGETS_GOALS,
-                    spokenReply = "Created savings goal $goalName with target ${InrMoney.formatPaise(amountPaise)}."
+                    spokenReply = if (amountPaise > 0L) {
+                        "Prepared savings goal $goalName with target ${InrMoney.formatPaise(amountPaise)}."
+                    } else {
+                        "What is the target amount for your $goalName goal?"
+                    }
                 )
             }
         }
 
-        // 5e. Add Loan or Gift Card by Voice
-        if (lower.contains("gift card") && (lower.contains("add") || lower.contains("create")) && amountPaise > 0L) {
+        // 5e. Add Loan, Gift Card, or Tax Record by Voice
+        if (lower.contains("gift card") && (lower.contains("add") || lower.contains("create"))) {
             val brandRegex = Regex("""(?:add|create)\s+(?:a|an)?\s*([A-Za-z0-9 &.-]{2,20}?)\s+gift\s+card""", RegexOption.IGNORE_CASE)
             val brand = brandRegex.find(cleaned)?.groupValues?.getOrNull(1)?.trim().orEmpty().ifBlank { "Gift Card" }
             return GeminiAssistantResult(
@@ -768,11 +794,45 @@ object GeminiVaultAssistant {
                 primaryAmountPaise = amountPaise,
                 targetTab = MainTab.MORE,
                 targetMore = MoreDestination.GIFT_CARDS,
-                spokenReply = "Added $brand gift card worth ${InrMoney.formatPaise(amountPaise)}."
+                spokenReply = if (amountPaise > 0L) {
+                    "Prepared $brand gift card worth ${InrMoney.formatPaise(amountPaise)}."
+                } else {
+                    "What is the value in rupees of the $brand gift card?"
+                }
             )
         }
 
-        if (lower.contains("loan") && (lower.contains("add") || lower.contains("create")) && amountPaise > 0L) {
+        if ((lower.contains("tax") || lower.contains("tds") || lower.contains("challan")) &&
+            (lower.contains("add") || lower.contains("create") || lower.contains("record")) &&
+            !lower.startsWith("open ") && !lower.startsWith("show ")
+        ) {
+            return GeminiAssistantResult(
+                action = "ADD_TAX_RECORD",
+                entityName = "VOICE-TAX",
+                primaryAmountPaise = amountPaise,
+                targetTab = MainTab.MORE,
+                targetMore = MoreDestination.TAXES,
+                spokenReply = if (amountPaise > 0L) {
+                    "Prepared tax record of ${InrMoney.formatPaise(amountPaise)}."
+                } else {
+                    "What is the tax payment amount in rupees?"
+                }
+            )
+        }
+
+        if ((lower.contains("pay") || lower.contains("record")) && lower.contains("emi")) {
+            val loanHint = extractEntityNameAfterKeyword(cleaned, listOf("pay", "record", "for"), "emi")
+            return GeminiAssistantResult(
+                action = "PAY_LOAN_EMI",
+                entityName = loanHint,
+                primaryAmountPaise = amountPaise,
+                targetTab = MainTab.MORE,
+                targetMore = MoreDestination.LOANS,
+                spokenReply = "Checking loan EMI to pay."
+            )
+        }
+
+        if (lower.contains("loan") && (lower.contains("add") || lower.contains("create"))) {
             val loanType = when {
                 lower.contains("home") || lower.contains("housing") -> "HOME"
                 lower.contains("car") || lower.contains("vehicle") || lower.contains("auto") || lower.contains("bike") -> "VEHICLE"
@@ -781,12 +841,12 @@ object GeminiVaultAssistant {
                 else -> "PERSONAL"
             }
             val rateMatch = Regex("""(\d+(?:\.\d+)?)\s*(?:%|percent)""", RegexOption.IGNORE_CASE).find(cleaned)
-            val rate = rateMatch?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 9.5
+            val rate = rateMatch?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
             val monthsMatch = Regex("""(\d+)\s*months?""", RegexOption.IGNORE_CASE).find(cleaned)
             val yearsMatch = Regex("""(\d+)\s*years?""", RegexOption.IGNORE_CASE).find(cleaned)
             val tenure = monthsMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?: (yearsMatch?.groupValues?.getOrNull(1)?.toIntOrNull()?.times(12))
-                ?: 36
+                ?: 0
             return GeminiAssistantResult(
                 action = "ADD_LOAN",
                 entityName = "${loanType.lowercase(Locale.US).replaceFirstChar { it.uppercase() }} Loan",
@@ -796,7 +856,11 @@ object GeminiVaultAssistant {
                 frequencyOrTypeHint = loanType,
                 targetTab = MainTab.MORE,
                 targetMore = MoreDestination.LOANS,
-                spokenReply = "Added $loanType loan of ${InrMoney.formatPaise(amountPaise)} at $rate% for $tenure months."
+                spokenReply = if (amountPaise > 0L) {
+                    "Prepared $loanType loan of ${InrMoney.formatPaise(amountPaise)}."
+                } else {
+                    "What is the principal amount for this $loanType loan?"
+                }
             )
         }
 

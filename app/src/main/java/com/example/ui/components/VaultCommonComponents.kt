@@ -1441,6 +1441,7 @@ fun RecordTransactionDialog(
     giftCards: List<GiftCardEntity>,
     transactions: List<TransactionEntity>,
     customCategories: List<String> = emptyList(),
+    isLocationTaggingEnabled: Boolean = false,
     onAddCustomCategory: (String) -> Unit = {},
     onDismiss: () -> Unit,
     onSubmit: (
@@ -1580,24 +1581,26 @@ fun RecordTransactionDialog(
         }
     }
 
-    LaunchedEffect(Unit) {
-        if (LocationHelper.hasLocationPermission(context)) {
-            isFetchingGps = true
-            val loc = LocationHelper.fetchCurrentLocation(context)
-            if (loc != null) {
-                capturedGps = loc
-                capturedLat = loc.latitude
-                capturedLng = loc.longitude
-                locationNameInput = LocationHelper.mergeLocationWithLiveGps(locationNameInput, loc)
-            }
-            isFetchingGps = false
-        } else {
-            locationPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
+    LaunchedEffect(isLocationTaggingEnabled) {
+        if (isLocationTaggingEnabled) {
+            if (LocationHelper.hasLocationPermission(context)) {
+                isFetchingGps = true
+                val loc = LocationHelper.fetchCurrentLocation(context)
+                if (loc != null) {
+                    capturedGps = loc
+                    capturedLat = loc.latitude
+                    capturedLng = loc.longitude
+                    locationNameInput = LocationHelper.mergeLocationWithLiveGps(locationNameInput, loc)
+                }
+                isFetchingGps = false
+            } else {
+                locationPermissionLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -1715,7 +1718,7 @@ fun RecordTransactionDialog(
         }
 
         scope.launch {
-            val activeGps = capturedGps ?: if (LocationHelper.hasLocationPermission(context)) {
+            val activeGps = capturedGps ?: if (isLocationTaggingEnabled && LocationHelper.hasLocationPermission(context)) {
                 isFetchingGps = true
                 val fetched = LocationHelper.fetchCurrentLocation(context)
                 isFetchingGps = false

@@ -1,16 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Finance Vault Data Extraction Policy (Android 12+):
+    Prevents automatic cloud extraction and unverified device-to-device migration of raw SQLite
+    databases, WAL/SHM sidecar files, shared preferences, and DataStore files containing
+    financial records or PBKDF2 PIN state. Users migrate data via versioned, integrity-checked,
+    optionally AES-256-GCM encrypted JSON backups.
+-->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="database" path="finance_vault.db" />
         <exclude domain="database" path="finance_vault.db-wal" />
         <exclude domain="database" path="finance_vault.db-shm" />
+        <exclude domain="database" path="finance_vault.db-journal" />
+        <exclude domain="database" path="." />
         <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="datastore" />
+        <exclude domain="file" path="exports" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="database" path="finance_vault.db" />
         <exclude domain="database" path="finance_vault.db-wal" />
         <exclude domain="database" path="finance_vault.db-shm" />
+        <exclude domain="database" path="finance_vault.db-journal" />
+        <exclude domain="database" path="." />
         <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="datastore" />
+        <exclude domain="file" path="exports" />
     </device-transfer>
 </data-extraction-rules>
 

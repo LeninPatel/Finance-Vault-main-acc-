@@ -30,6 +30,9 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM accounts WHERE id = :id")
     suspend fun getAccountById(id: Long): AccountEntity?
 
+    @Query("SELECT * FROM accounts WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getAccountByIdAndMode(id: Long, isDemo: Boolean): AccountEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAccount(account: AccountEntity): Long
 
@@ -45,6 +48,9 @@ interface FinanceVaultDao {
 
     @Query("SELECT * FROM ledger_accounts WHERE id = :id")
     suspend fun getLedgerAccountById(id: Long): LedgerAccountEntity?
+
+    @Query("SELECT * FROM ledger_accounts WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getLedgerAccountByIdAndMode(id: Long, isDemo: Boolean): LedgerAccountEntity?
 
     @Query("SELECT * FROM ledger_accounts WHERE linkedUserAccountId = :userAccountId AND isDemo = :isDemo LIMIT 1")
     suspend fun getLedgerByUserAccountId(userAccountId: Long, isDemo: Boolean): LedgerAccountEntity?
@@ -83,6 +89,12 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM transactions WHERE id = :id")
     suspend fun getTransactionById(id: Long): TransactionEntity?
 
+    @Query("SELECT * FROM transactions WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getTransactionByIdAndMode(id: Long, isDemo: Boolean): TransactionEntity?
+
+    @Query("SELECT * FROM transactions WHERE linkedOriginalTransactionId = :originalTxId AND isDemo = :isDemo AND isReversed = 0 AND transactionType = 'REFUND_RECEIVED'")
+    suspend fun getActiveRefundsForOriginalTransaction(originalTxId: Long, isDemo: Boolean): List<TransactionEntity>
+
     @Query("SELECT * FROM transactions WHERE id IN (:ids)")
     suspend fun getTransactionsByIds(ids: List<Long>): List<TransactionEntity>
 
@@ -104,6 +116,9 @@ interface FinanceVaultDao {
 
     @Query("SELECT * FROM journal_entries WHERE transactionId = :transactionId LIMIT 1")
     suspend fun getJournalEntryForTransaction(transactionId: Long): JournalEntryEntity?
+
+    @Query("SELECT * FROM journal_entries WHERE transactionId = :transactionId AND isDemo = :isDemo LIMIT 1")
+    suspend fun getJournalEntryForTransactionAndMode(transactionId: Long, isDemo: Boolean): JournalEntryEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertJournalEntry(entry: JournalEntryEntity): Long
@@ -139,6 +154,9 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM investments WHERE id = :id")
     suspend fun getInvestmentById(id: Long): InvestmentEntity?
 
+    @Query("SELECT * FROM investments WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getInvestmentByIdAndMode(id: Long, isDemo: Boolean): InvestmentEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertInvestment(investment: InvestmentEntity): Long
 
@@ -154,6 +172,9 @@ interface FinanceVaultDao {
 
     @Query("SELECT * FROM loans WHERE id = :id")
     suspend fun getLoanById(id: Long): LoanEntity?
+
+    @Query("SELECT * FROM loans WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getLoanByIdAndMode(id: Long, isDemo: Boolean): LoanEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLoan(loan: LoanEntity): Long
@@ -177,11 +198,17 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM budgets WHERE isDemo = :isDemo ORDER BY id ASC")
     suspend fun getBudgets(isDemo: Boolean): List<BudgetEntity>
 
+    @Query("SELECT * FROM budgets WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getBudgetByIdAndMode(id: Long, isDemo: Boolean): BudgetEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBudget(budget: BudgetEntity): Long
 
     @Update
     suspend fun updateBudget(budget: BudgetEntity)
+
+    @Query("DELETE FROM budgets WHERE id = :id AND isDemo = :isDemo")
+    suspend fun deleteBudgetByIdAndMode(id: Long, isDemo: Boolean)
 
     @Query("DELETE FROM budgets WHERE id = :id")
     suspend fun deleteBudgetById(id: Long)
@@ -196,11 +223,17 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM goals WHERE id = :id")
     suspend fun getGoalById(id: Long): GoalEntity?
 
+    @Query("SELECT * FROM goals WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getGoalByIdAndMode(id: Long, isDemo: Boolean): GoalEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertGoal(goal: GoalEntity): Long
 
     @Update
     suspend fun updateGoal(goal: GoalEntity)
+
+    @Query("DELETE FROM goals WHERE id = :id AND isDemo = :isDemo")
+    suspend fun deleteGoalByIdAndMode(id: Long, isDemo: Boolean)
 
     @Query("DELETE FROM goals WHERE id = :id")
     suspend fun deleteGoalById(id: Long)
@@ -214,6 +247,9 @@ interface FinanceVaultDao {
 
     @Query("SELECT * FROM gift_cards WHERE id = :id")
     suspend fun getGiftCardById(id: Long): GiftCardEntity?
+
+    @Query("SELECT * FROM gift_cards WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getGiftCardByIdAndMode(id: Long, isDemo: Boolean): GiftCardEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertGiftCard(giftCard: GiftCardEntity): Long
@@ -231,11 +267,17 @@ interface FinanceVaultDao {
     @Query("SELECT * FROM subscriptions WHERE id = :id")
     suspend fun getSubscriptionById(id: Long): SubscriptionEntity?
 
+    @Query("SELECT * FROM subscriptions WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getSubscriptionByIdAndMode(id: Long, isDemo: Boolean): SubscriptionEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSubscription(subscription: SubscriptionEntity): Long
 
     @Update
     suspend fun updateSubscription(subscription: SubscriptionEntity)
+
+    @Query("DELETE FROM subscriptions WHERE id = :id AND isDemo = :isDemo")
+    suspend fun deleteSubscriptionByIdAndMode(id: Long, isDemo: Boolean)
 
     @Query("DELETE FROM subscriptions WHERE id = :id")
     suspend fun deleteSubscriptionById(id: Long)
@@ -246,6 +288,9 @@ interface FinanceVaultDao {
 
     @Query("SELECT * FROM taxes WHERE isDemo = :isDemo ORDER BY id ASC")
     suspend fun getTaxRecords(isDemo: Boolean): List<TaxRecordEntity>
+
+    @Query("SELECT * FROM taxes WHERE id = :id AND isDemo = :isDemo LIMIT 1")
+    suspend fun getTaxRecordByIdAndMode(id: Long, isDemo: Boolean): TaxRecordEntity?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTaxRecord(taxRecord: TaxRecordEntity): Long

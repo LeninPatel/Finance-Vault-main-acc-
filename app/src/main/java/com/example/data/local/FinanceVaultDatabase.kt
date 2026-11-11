@@ -11,68 +11,80 @@ class FinanceTypeConverters {
     @TypeConverter
     fun fromAccountType(v: AccountType): String = v.name
     @TypeConverter
-    fun toAccountType(v: String): AccountType = AccountType.valueOf(v)
+    fun toAccountType(v: String): AccountType =
+        runCatching { AccountType.valueOf(v.trim()) }.getOrDefault(AccountType.OTHER)
 
     @TypeConverter
     fun fromNormalBalance(v: NormalBalance): String = v.name
     @TypeConverter
-    fun toNormalBalance(v: String): NormalBalance = NormalBalance.valueOf(v)
+    fun toNormalBalance(v: String): NormalBalance =
+        runCatching { NormalBalance.valueOf(v.trim()) }.getOrDefault(NormalBalance.DEBIT)
 
     @TypeConverter
     fun fromLedgerClassification(v: LedgerClassification): String = v.name
     @TypeConverter
-    fun toLedgerClassification(v: String): LedgerClassification = LedgerClassification.valueOf(v)
+    fun toLedgerClassification(v: String): LedgerClassification =
+        runCatching { LedgerClassification.valueOf(v.trim()) }.getOrDefault(LedgerClassification.EXPENSE_OTHER)
 
     @TypeConverter
     fun fromTransactionType(v: TransactionType): String = v.name
     @TypeConverter
-    fun toTransactionType(v: String): TransactionType = TransactionType.valueOf(v)
+    fun toTransactionType(v: String): TransactionType =
+        runCatching { TransactionType.valueOf(v.trim()) }.getOrDefault(TransactionType.EXPENSE)
 
     @TypeConverter
     fun fromPostingStatus(v: PostingStatus): String = v.name
     @TypeConverter
-    fun toPostingStatus(v: String): PostingStatus = PostingStatus.valueOf(v)
+    fun toPostingStatus(v: String): PostingStatus =
+        runCatching { PostingStatus.valueOf(v.trim()) }.getOrDefault(PostingStatus.POSTED)
 
     @TypeConverter
     fun fromInvestmentCategory(v: InvestmentCategory): String = v.name
     @TypeConverter
-    fun toInvestmentCategory(v: String): InvestmentCategory = InvestmentCategory.valueOf(v)
+    fun toInvestmentCategory(v: String): InvestmentCategory =
+        runCatching { InvestmentCategory.valueOf(v.trim()) }.getOrDefault(InvestmentCategory.OTHER)
 
     @TypeConverter
     fun fromCompoundingFrequency(v: CompoundingFrequency): String = v.name
     @TypeConverter
-    fun toCompoundingFrequency(v: String): CompoundingFrequency = CompoundingFrequency.valueOf(v)
+    fun toCompoundingFrequency(v: String): CompoundingFrequency =
+        runCatching { CompoundingFrequency.valueOf(v.trim()) }.getOrDefault(CompoundingFrequency.QUARTERLY)
 
     @TypeConverter
     fun fromLoanType(v: LoanType): String = v.name
     @TypeConverter
-    fun toLoanType(v: String): LoanType = LoanType.valueOf(v)
+    fun toLoanType(v: String): LoanType =
+        runCatching { LoanType.valueOf(v.trim()) }.getOrDefault(LoanType.OTHER)
 
     @TypeConverter
     fun fromBudgetPeriod(v: BudgetPeriod): String = v.name
     @TypeConverter
-    fun toBudgetPeriod(v: String): BudgetPeriod = BudgetPeriod.valueOf(v)
+    fun toBudgetPeriod(v: String): BudgetPeriod =
+        runCatching { BudgetPeriod.valueOf(v.trim()) }.getOrDefault(BudgetPeriod.MONTHLY)
 
     @TypeConverter
     fun fromGoalType(v: GoalType): String = v.name
     @TypeConverter
-    fun toGoalType(v: String): GoalType = GoalType.valueOf(v)
+    fun toGoalType(v: String): GoalType =
+        runCatching { GoalType.valueOf(v.trim()) }.getOrDefault(GoalType.SAVINGS)
 
     @TypeConverter
     fun fromBillingFrequency(v: BillingFrequency): String = v.name
     @TypeConverter
     fun toBillingFrequency(v: String): BillingFrequency =
-        runCatching { BillingFrequency.valueOf(v) }.getOrDefault(BillingFrequency.MONTHLY)
+        runCatching { BillingFrequency.valueOf(v.trim()) }.getOrDefault(BillingFrequency.MONTHLY)
 
     @TypeConverter
     fun fromTaxType(v: TaxType): String = v.name
     @TypeConverter
-    fun toTaxType(v: String): TaxType = TaxType.valueOf(v)
+    fun toTaxType(v: String): TaxType =
+        runCatching { TaxType.valueOf(v.trim()) }.getOrDefault(TaxType.OTHER)
 
     @TypeConverter
     fun fromThemeMode(v: ThemeMode): String = v.name
     @TypeConverter
-    fun toThemeMode(v: String): ThemeMode = runCatching { ThemeMode.valueOf(v) }.getOrDefault(ThemeMode.DARK)
+    fun toThemeMode(v: String): ThemeMode =
+        runCatching { ThemeMode.valueOf(v.trim()) }.getOrDefault(ThemeMode.DARK)
 }
 
 @Database(
@@ -93,7 +105,7 @@ class FinanceTypeConverters {
         TaxRecordEntity::class,
         AuditLogEntity::class
     ],
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 @TypeConverters(FinanceTypeConverters::class)
@@ -101,6 +113,9 @@ abstract class FinanceVaultDatabase : RoomDatabase() {
     abstract fun dao(): FinanceVaultDao
 
     companion object {
+        const val DATABASE_NAME = "finance_vault.db"
+        const val SCHEMA_VERSION = 8
+
         @Volatile
         private var INSTANCE: FinanceVaultDatabase? = null
 
@@ -161,13 +176,20 @@ abstract class FinanceVaultDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_7_8 = object : androidx.room.migration.Migration(7, 8) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE app_settings ADD COLUMN isLocationTaggingEnabled INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         val ALL_MIGRATIONS = arrayOf(
             MIGRATION_1_2,
             MIGRATION_2_3,
             MIGRATION_3_4,
             MIGRATION_4_5,
             MIGRATION_5_6,
-            MIGRATION_6_7
+            MIGRATION_6_7,
+            MIGRATION_7_8
         )
 
         fun getInstance(context: Context): FinanceVaultDatabase {
@@ -175,7 +197,7 @@ abstract class FinanceVaultDatabase : RoomDatabase() {
                 val instance = Room.databaseBuilder(
                     context.applicationContext,
                     FinanceVaultDatabase::class.java,
-                    "finance_vault.db"
+                    DATABASE_NAME
                 )
                     .addMigrations(*ALL_MIGRATIONS)
                     .build()

@@ -1128,6 +1128,11 @@ fun AiTransactionConfirmationCard(
 ) {
     val amountFormatted = com.example.domain.money.InrMoney.formatPaise(confirmation.amountPaise)
     val dateFormatted = com.example.domain.period.IndianFinancialYear.formatEpochDay(confirmation.dateEpochDay)
+    val typeBadgeLabel = if (confirmation.operationType == "RECORD_TRANSACTION" || confirmation.operationType == "REVERSE_TRANSACTION") {
+        confirmation.transactionType.userLabel.uppercase()
+    } else {
+        confirmation.operationType.replace("_", " ")
+    }
 
     VaultGlassCard(
         accentColor = VaultEmerald,
@@ -1152,7 +1157,7 @@ fun AiTransactionConfirmationCard(
                     Spacer(modifier = Modifier.width(8.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Confirm AI Transaction",
+                            text = confirmation.operationTitle,
                             style = MaterialTheme.typography.titleSmall,
                             color = VaultEmerald,
                             fontWeight = FontWeight.Bold
@@ -1172,7 +1177,7 @@ fun AiTransactionConfirmationCard(
                 ) {
                     Icon(
                         imageVector = Icons.Default.Close,
-                        contentDescription = "Cancel AI Transaction",
+                        contentDescription = "Cancel AI Operation",
                         tint = VaultTextSecondary,
                         modifier = Modifier.size(16.dp)
                     )
@@ -1194,7 +1199,7 @@ fun AiTransactionConfirmationCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = confirmation.transactionType.userLabel.uppercase(),
+                        text = typeBadgeLabel,
                         style = MaterialTheme.typography.labelSmall,
                         color = VaultCyan,
                         fontWeight = FontWeight.Bold
@@ -1207,7 +1212,12 @@ fun AiTransactionConfirmationCard(
                     )
                 }
                 Text(
-                    text = "${confirmation.category.ifBlank { "General" }} • ${confirmation.description.ifBlank { "Transaction" }}",
+                    text = "Category: ${confirmation.category.ifBlank { "General" }}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = VaultTextSecondary
+                )
+                Text(
+                    text = "Description: ${confirmation.description.ifBlank { "Transaction" }}",
                     style = MaterialTheme.typography.bodySmall,
                     color = VaultTextPrimary,
                     fontWeight = FontWeight.SemiBold,
@@ -1223,13 +1233,11 @@ fun AiTransactionConfirmationCard(
                         append("To: ${confirmation.destinationAccountName}")
                     }
                 }
-                if (accountSummary.isNotBlank()) {
-                    Text(
-                        text = "$accountSummary • $dateFormatted",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = VaultTextSecondary
-                    )
-                }
+                Text(
+                    text = if (accountSummary.isNotBlank()) "$accountSummary • Date: $dateFormatted" else "Date: $dateFormatted",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = VaultTextSecondary
+                )
                 if (confirmation.locationName.isNotBlank()) {
                     Text(
                         text = "📍 ${confirmation.locationName}",
@@ -1273,4 +1281,5 @@ fun AiTransactionConfirmationCard(
         }
     }
 }
+
 

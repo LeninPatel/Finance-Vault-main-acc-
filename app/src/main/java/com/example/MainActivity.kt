@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -209,6 +211,16 @@ class MainActivity : ComponentActivity() {
         incomingIntentState.value = intent
     }
 
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        activeViewModel?.recordUserInteraction()
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        activeViewModel?.recordUserInteraction()
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onProvideAssistData(data: Bundle?) {
         super.onProvideAssistData(data)
         if (data != null) {
@@ -288,26 +300,27 @@ fun FinanceVaultApp(
     val pendingDisambiguation by viewModel.pendingVoiceDisambiguation.collectAsStateWithLifecycle()
     val pendingAiConfirmation by viewModel.pendingAiConfirmation.collectAsStateWithLifecycle()
     val pinLockoutMessage by viewModel.pinLockoutErrorMessage.collectAsStateWithLifecycle()
+    val restorePreview by viewModel.pendingBackupRestorePreview.collectAsStateWithLifecycle()
     val reminderState by TransactionRecallReminderManager.state.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Enforce background auto-lock timeout when a PIN is configured
-    DisposableEffect(lifecycleOwner, uiState.settings.autoLockMinutes, uiState.settings.pinHashSha256) {
-        var backgroundedAtMillis = 0L
+    // Enforce background auto-lock policy while avoiding false locks on configuration changes
+    DisposableEffect(
+        lifecycleOwner,
+        uiState.settings.autoLockMinutes,
+        uiState.settings.pinHashSha256,
+        uiState.settings.isBiometricEnabled
+    ) {
         val observer = LifecycleEventObserver { _, event ->
+            val activity = context as? Activity
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
-                    backgroundedAtMillis = System.currentTimeMillis()
+                    viewModel.onAppBackgrounded(
+                        isChangingConfigurations = activity?.isChangingConfigurations == true
+                    )
                 }
                 Lifecycle.Event.ON_START -> {
-                    if (backgroundedAtMillis > 0L && !uiState.settings.pinHashSha256.isNullOrBlank()) {
-                        val elapsedMillis = System.currentTimeMillis() - backgroundedAtMillis
-                        val timeoutMillis = uiState.settings.autoLockMinutes.coerceAtLeast(1) * 60_000L
-                        if (elapsedMillis >= timeoutMillis) {
-                            viewModel.lockAppNow()
-                        }
-                    }
-                    backgroundedAtMillis = 0L
+                    viewModel.onAppForegrounded()
                 }
                 else -> Unit
             }
@@ -315,6 +328,22 @@ fun FinanceVaultApp(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    // Periodically evaluate foreground inactivity timeout when unlocked
+    LaunchedEffect(
+        uiState.isLockedByPin,
+        uiState.settings.autoLockMinutes,
+        uiState.settings.pinHashSha256,
+        uiState.settings.isBiometricEnabled
+    ) {
+        val hasLockMethod = !uiState.settings.pinHashSha256.isNullOrBlank() || uiState.settings.isBiometricEnabled
+        if (!uiState.isLockedByPin && hasLockMethod) {
+            while (true) {
+                delay(5_000L)
+                viewModel.checkInactivityTimeout()
+            }
         }
     }
 
@@ -365,6 +394,7 @@ fun FinanceVaultApp(
     }
 
     val triggerVoiceCommandOnDemand: () -> Unit = {
+        val wantsLocation = uiState.settings.isLocationTaggingEnabled
         val hasLocationPerm = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_FINE_LOCATION
@@ -373,10 +403,9 @@ fun FinanceVaultApp(
             Manifest.permission.ACCESS_COARSE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
 
-        if (hasAudioPermission && hasLocationPerm) {
+        if (hasAudioPermission && (!wantsLocation || hasLocationPerm)) {
             voiceController.toggleListeningSession()
-        } else if (hasAudioPermission && !hasLocationPerm) {
-            // Start listening immediately and request location permission in parallel if needed
+        } else if (hasAudioPermission && wantsLocation && !hasLocationPerm) {
             voiceController.toggleListeningSession()
             runCatching {
                 permissionsLauncher.launch(
@@ -388,14 +417,15 @@ fun FinanceVaultApp(
             }
         } else {
             pendingStartVoiceAfterPermission = true
+            val permsToLaunch = buildList {
+                add(Manifest.permission.RECORD_AUDIO)
+                if (wantsLocation && !hasLocationPerm) {
+                    add(Manifest.permission.ACCESS_FINE_LOCATION)
+                    add(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }
+            }
             runCatching {
-                permissionsLauncher.launch(
-                    arrayOf(
-                        Manifest.permission.RECORD_AUDIO,
-                        Manifest.permission.ACCESS_FINE_LOCATION,
-                        Manifest.permission.ACCESS_COARSE_LOCATION
-                    )
-                )
+                permissionsLauncher.launch(permsToLaunch.toTypedArray())
             }
         }
     }
@@ -406,30 +436,18 @@ fun FinanceVaultApp(
         }
     }
 
-    // Request notification and location permissions on launch (never auto-start microphone on launch)
+    // Request notification permission on launch (never auto-request location or microphone on launch)
     LaunchedEffect(uiState.isInitializing, uiState.isLockedByPin) {
         if (!uiState.isInitializing && !uiState.isLockedByPin) {
-            val permsToRequest = mutableListOf<String>()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val hasNotifPerm = ContextCompat.checkSelfPermission(
                     context,
                     Manifest.permission.POST_NOTIFICATIONS
                 ) == PackageManager.PERMISSION_GRANTED
                 if (!hasNotifPerm) {
-                    permsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
-                }
-            }
-            val hasLocPerm = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!hasLocPerm) {
-                permsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
-                permsToRequest.add(Manifest.permission.ACCESS_COARSE_LOCATION)
-            }
-            if (permsToRequest.isNotEmpty()) {
-                runCatching {
-                    permissionsLauncher.launch(permsToRequest.toTypedArray())
+                    runCatching {
+                        permissionsLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                    }
                 }
             }
         }
@@ -1330,6 +1348,7 @@ fun FinanceVaultApp(
                                 MoreDestination.SETTINGS -> {
                                     SettingsAndAboutScreen(
                                         uiState = uiState,
+                                        restorePreview = restorePreview,
                                         onUpdateProfileAndFy = { name, pan, fy ->
                                             viewModel.updateProfileAndFy(name, pan, fy)
                                         },
@@ -1341,9 +1360,18 @@ fun FinanceVaultApp(
                                         onTogglePrivacy = { viewModel.togglePrivacyMode() },
                                         onToggleDemoMode = { viewModel.toggleDemoMode(it) },
                                         onToggleAiConsent = { viewModel.setAiFinancialContextConsent(it) },
+                                        onToggleLocationTagging = { viewModel.setLocationTaggingEnabled(it) },
                                         onUpdateAutoLockMinutes = { viewModel.updateAutoLockMinutes(it) },
-                                        onExportJsonBackup = { viewModel.prepareJsonBackupExport(context) },
-                                        onRestoreJsonBackup = { viewModel.restoreFromJsonBackup(it) },
+                                        onExportJsonBackup = { password ->
+                                            viewModel.prepareJsonBackupExport(context, password)
+                                        },
+                                        onInspectJsonBackup = { jsonText, password ->
+                                            viewModel.inspectBackupBeforeRestore(jsonText, password)
+                                        },
+                                        onDismissRestorePreview = { viewModel.dismissBackupRestorePreview() },
+                                        onRestoreJsonBackup = { jsonText, password, mode ->
+                                            viewModel.restoreFromJsonBackup(jsonText, password, mode)
+                                        },
                                         onClearData = { viewModel.clearCurrentModeData() },
                                         onBack = { viewModel.navigateMore(MoreDestination.HUB) }
                                     )
@@ -1545,6 +1573,7 @@ fun FinanceVaultApp(
             giftCards = uiState.giftCards,
             transactions = uiState.transactions,
             customCategories = uiState.customOptionsMap["TX_CATEGORY"].orEmpty(),
+            isLocationTaggingEnabled = uiState.settings.isLocationTaggingEnabled,
             onAddCustomCategory = { viewModel.addCustomOption("TX_CATEGORY", it) },
             onDismiss = { viewModel.openAddTransactionSheet(false) },
             onSubmit = { type, date, amt, prin, interest, charges, costDisp, srcId, dstId, cat, desc, ref, notes, locName, lat, lng, invId, loanId, gcId, origTxId ->

@@ -106,6 +106,28 @@ object AccountingEngine {
     }
 
     /**
+     * Overflow-safe addition for paise amounts. Converts ArithmeticException into a clear IllegalArgumentException.
+     */
+    fun safeAddPaise(a: Long, b: Long): Long {
+        return try {
+            Math.addExact(a, b)
+        } catch (e: ArithmeticException) {
+            throw IllegalArgumentException("Monetary amount overflow detected while adding $a and $b paise.", e)
+        }
+    }
+
+    /**
+     * Overflow-safe subtraction for paise amounts.
+     */
+    fun safeSubtractPaise(a: Long, b: Long): Long {
+        return try {
+            Math.subtractExact(a, b)
+        } catch (e: ArithmeticException) {
+            throw IllegalArgumentException("Monetary amount overflow detected while subtracting $b from $a paise.", e)
+        }
+    }
+
+    /**
      * Builds and validates the double-entry journal lines for any supported transaction type.
      */
     fun buildPostingPlan(
@@ -127,6 +149,25 @@ object AccountingEngine {
         capitalLossLedger: LedgerAccountEntity? = null
     ): ValidatedPostingPlan {
         require(amountPaise > 0L) { "Transaction amount must be strictly greater than ₹0." }
+        require(principalComponentPaise >= 0L) { "Principal component cannot be negative ($principalComponentPaise paise)." }
+        require(interestComponentPaise >= 0L) { "Interest component cannot be negative ($interestComponentPaise paise)." }
+        require(chargesPaise >= 0L) { "Charges/brokerage cannot be negative ($chargesPaise paise)." }
+        require(costBasisDisposedPaise >= 0L) { "Disposed cost basis cannot be negative ($costBasisDisposedPaise paise)." }
+
+        val providedLedgers = listOfNotNull(
+            sourceLedger,
+            destinationLedger,
+            categoryLedger,
+            openingCapitalLedger,
+            interestExpenseLedger,
+            interestIncomeLedger,
+            investmentFeeLedger,
+            capitalGainLedger,
+            capitalLossLedger
+        )
+        require(providedLedgers.map { it.isDemo }.distinct().size <= 1) {
+            "Cross-mode reference violation: cannot mix Demo and Real ledger accounts in a single transaction."
+        }
 
         val lines = mutableListOf<DraftJournalLine>()
         val cleanDesc = description.ifBlank { transactionType.userLabel }
@@ -194,7 +235,7 @@ object AccountingEngine {
                 val invAsset = requireNotNull(destinationLedger) { "Investment asset ledger is required." }
                 if (chargesPaise > 0L) {
                     val feeLedger = requireNotNull(investmentFeeLedger) { "Investment fee ledger is required when brokerage charges exist." }
-                    val totalOutflow = amountPaise + chargesPaise
+                    val totalOutflow = safeAddPaise(amountPaise, chargesPaise)
                     lines.add(DraftJournalLine(invAsset, debitPaise = amountPaise, creditPaise = 0L, narration = cleanDesc))
                     lines.add(DraftJournalLine(feeLedger, debitPaise = chargesPaise, creditPaise = 0L, narration = "Brokerage / charges for $cleanDesc"))
                     lines.add(DraftJournalLine(bankSrc, debitPaise = 0L, creditPaise = totalOutflow, narration = cleanDesc))
@@ -211,7 +252,7 @@ object AccountingEngine {
                     "Sale proceeds ($amountPaise paise) must exceed brokerage/charges ($chargesPaise paise)."
                 }
                 val costDisposed = if (costBasisDisposedPaise > 0L) costBasisDisposedPaise else amountPaise
-                val netProceedsToBank = amountPaise - chargesPaise
+                val netProceedsToBank = safeSubtractPaise(amountPaise, chargesPaise)
 
                 lines.add(DraftJournalLine(bankDest, debitPaise = netProceedsToBank, creditPaise = 0L, narration = "Sale proceeds: $cleanDesc"))
                 if (chargesPaise > 0L) {
@@ -220,13 +261,13 @@ object AccountingEngine {
                 }
                 lines.add(DraftJournalLine(invAsset, debitPaise = 0L, creditPaise = costDisposed, narration = "Cost basis disposed: $cleanDesc"))
 
-                val gainOrLoss = amountPaise - costDisposed
+                val gainOrLoss = safeSubtractPaise(amountPaise, costDisposed)
                 if (gainOrLoss > 0L) {
                     val gainLedger = requireNotNull(capitalGainLedger) { "Capital Gain ledger required." }
                     lines.add(DraftJournalLine(gainLedger, debitPaise = 0L, creditPaise = gainOrLoss, narration = "Realized gain on $cleanDesc"))
                 } else if (gainOrLoss < 0L) {
                     val lossLedger = requireNotNull(capitalLossLedger) { "Capital Loss ledger required." }
-                    lines.add(DraftJournalLine(lossLedger, debitPaise = -gainOrLoss, creditPaise = 0L, narration = "Realized loss on $cleanDesc"))
+                    lines.add(DraftJournalLine(lossLedger, debitPaise = safeSubtractPaise(0L, gainOrLoss), creditPaise = 0L, narration = "Realized loss on $cleanDesc"))
                 }
             }
 
@@ -234,8 +275,16 @@ object AccountingEngine {
             TransactionType.RD_MATURITY -> {
                 val invAsset = requireNotNull(sourceLedger) { "Deposit asset ledger is required." }
                 val bankDest = requireNotNull(destinationLedger) { "Destination bank account is required." }
-                val principal = if (principalComponentPaise > 0L) principalComponentPaise else (amountPaise - interestComponentPaise).coerceAtLeast(0L)
-                val interest = (amountPaise - principal).coerceAtLeast(0L)
+                require(principalComponentPaise <= amountPaise && interestComponentPaise <= amountPaise) {
+                    "Maturity principal ($principalComponentPaise) and interest ($interestComponentPaise) cannot exceed maturity proceeds ($amountPaise)."
+                }
+                if (principalComponentPaise > 0L && interestComponentPaise > 0L) {
+                    require(safeAddPaise(principalComponentPaise, interestComponentPaise) == amountPaise) {
+                        "Maturity principal ($principalComponentPaise) + interest ($interestComponentPaise) must equal total maturity proceeds ($amountPaise)."
+                    }
+                }
+                val principal = if (principalComponentPaise > 0L) principalComponentPaise else safeSubtractPaise(amountPaise, interestComponentPaise).coerceAtLeast(0L)
+                val interest = safeSubtractPaise(amountPaise, principal).coerceAtLeast(0L)
                 lines.add(DraftJournalLine(bankDest, debitPaise = amountPaise, creditPaise = 0L, narration = "Maturity proceeds: $cleanDesc"))
                 if (principal > 0L) {
                     lines.add(DraftJournalLine(invAsset, debitPaise = 0L, creditPaise = principal, narration = "Principal matured: $cleanDesc"))
@@ -266,7 +315,7 @@ object AccountingEngine {
                 } else {
                     0L
                 }
-                require(principal + interest == amountPaise) {
+                require(safeAddPaise(principal, interest) == amountPaise) {
                     "Principal (${principal}p) + Interest (${interest}p) must equal total repayment (${amountPaise}p)."
                 }
                 if (principal > 0L) {
@@ -328,8 +377,8 @@ object AccountingEngine {
             }
         }
 
-        val totalDebits = lines.sumOf { it.debitPaise }
-        val totalCredits = lines.sumOf { it.creditPaise }
+        val totalDebits = lines.fold(0L) { acc, line -> safeAddPaise(acc, line.debitPaise) }
+        val totalCredits = lines.fold(0L) { acc, line -> safeAddPaise(acc, line.creditPaise) }
 
         return ValidatedPostingPlan(
             narration = cleanDesc,
@@ -352,6 +401,9 @@ object AccountingEngine {
             val ledger = requireNotNull(ledgerById[line.ledgerAccountId]) {
                 "Missing ledger account ${line.ledgerAccountId} for reversal."
             }
+            require(ledger.isDemo == line.isDemo) {
+                "Cross-mode reference violation during reversal of voucher $originalVoucherNumber."
+            }
             DraftJournalLine(
                 ledgerAccount = ledger,
                 debitPaise = line.creditPaise,
@@ -362,8 +414,8 @@ object AccountingEngine {
         return ValidatedPostingPlan(
             narration = "Reversal of Voucher $originalVoucherNumber",
             lines = reversedLines,
-            totalDebitPaise = reversedLines.sumOf { it.debitPaise },
-            totalCreditPaise = reversedLines.sumOf { it.creditPaise }
+            totalDebitPaise = reversedLines.fold(0L) { acc, l -> safeAddPaise(acc, l.debitPaise) },
+            totalCreditPaise = reversedLines.fold(0L) { acc, l -> safeAddPaise(acc, l.creditPaise) }
         )
     }
 
@@ -379,8 +431,8 @@ object AccountingEngine {
         totalCreditsPaise: Long
     ): Long {
         return when (normalBalance) {
-            NormalBalance.DEBIT -> openingBalancePaise + totalDebitsPaise - totalCreditsPaise
-            NormalBalance.CREDIT -> openingBalancePaise + totalCreditsPaise - totalDebitsPaise
+            NormalBalance.DEBIT -> safeSubtractPaise(safeAddPaise(openingBalancePaise, totalDebitsPaise), totalCreditsPaise)
+            NormalBalance.CREDIT -> safeSubtractPaise(safeAddPaise(openingBalancePaise, totalCreditsPaise), totalDebitsPaise)
         }
     }
 
@@ -390,11 +442,15 @@ object AccountingEngine {
      */
     fun verifyLedgerIntegrity(lines: List<JournalLineEntity>): Boolean {
         if (lines.isEmpty()) return true
-        val totalDebits = lines.sumOf { it.debitPaise }
-        val totalCredits = lines.sumOf { it.creditPaise }
-        if (totalDebits != totalCredits) return false
-        return lines.groupBy { it.journalEntryId }.values.all { entryLines ->
-            entryLines.sumOf { it.debitPaise } == entryLines.sumOf { it.creditPaise }
-        }
+        return runCatching {
+            val totalDebits = lines.fold(0L) { acc, l -> safeAddPaise(acc, l.debitPaise) }
+            val totalCredits = lines.fold(0L) { acc, l -> safeAddPaise(acc, l.creditPaise) }
+            if (totalDebits != totalCredits) return false
+            lines.groupBy { it.journalEntryId }.values.all { entryLines ->
+                val d = entryLines.fold(0L) { acc, l -> safeAddPaise(acc, l.debitPaise) }
+                val c = entryLines.fold(0L) { acc, l -> safeAddPaise(acc, l.creditPaise) }
+                d == c
+            }
+        }.getOrDefault(false)
     }
 }

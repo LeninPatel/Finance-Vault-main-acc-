@@ -482,5 +482,460 @@ class ExampleRobolectricTest {
         assertEquals(2_10_000_00L, bs.totalAssetsPaise)
         assertEquals(2_10_000_00L, bs.totalNetWorthPaise)
     }
+
+    @Test
+    fun `voice deletion regression - 6 mandatory scenarios never delete unrelated transactions and always require confirmation`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        repository.ensureInitialized()
+        val bankId = repository.createAccount(
+            name = "HDFC Bank",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 50_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 500L,
+            isDemo = false
+        )
+        val groceryTxId = repository.recordTransaction(
+            transactionType = TransactionType.EXPENSE,
+            dateEpochDay = 501L,
+            amountPaise = 850_00L,
+            sourceAccountId = bankId,
+            category = "Household & Groceries",
+            description = "Reliance Fresh Groceries",
+            isDemo = false
+        )
+
+        val vm = com.example.ui.FinanceVaultViewModel(repository)
+        composeTestRule.setContent {
+            com.example.ui.theme.MyApplicationTheme {
+                FinanceVaultApp(viewModel = vm)
+            }
+        }
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+            !vm.uiState.value.isInitializing && vm.uiState.value.transactions.any { it.id == groceryTxId }
+        }
+
+        // Case 1: One active transaction with a NON-matching keyword -> must NOT delete or stage reversal; asks for clarification
+        var reply1 = ""
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "delete Netflix transaction",
+            onFinished = { reply, _, _ -> reply1 = reply }
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { reply1.isNotBlank() }
+        org.junit.Assert.assertNull(
+            "Non-matching keyword must not stage a reversal preview even when activeTxs.size == 1",
+            vm.pendingAiConfirmation.value
+        )
+        assertTrue(reply1.contains("No transaction matched", ignoreCase = true))
+        org.junit.Assert.assertNotNull(vm.pendingVoiceDisambiguation.value)
+        vm.dismissVoiceDisambiguation()
+
+        // Case 2: Ambiguous delete request ("delete transaction") -> asks for clarification, never auto-reverses
+        var replyAmbiguous = ""
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "delete transaction",
+            onFinished = { reply, _, _ -> replyAmbiguous = reply }
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { replyAmbiguous.isNotBlank() }
+        org.junit.Assert.assertNull(vm.pendingAiConfirmation.value)
+        org.junit.Assert.assertNotNull(vm.pendingVoiceDisambiguation.value)
+        vm.dismissVoiceDisambiguation()
+
+        // Case 3: One active transaction with a MATCHING keyword -> stages confirmation preview first (does NOT immediately reverse)
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "delete Reliance Fresh Groceries transaction"
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { vm.pendingAiConfirmation.value != null }
+        val staged = vm.pendingAiConfirmation.value!!
+        assertEquals("REVERSE_TRANSACTION", staged.operationType)
+        assertEquals(groceryTxId, staged.targetTransactionIdToReverse)
+        // Verify transaction is still active before confirmation
+        assertTrue(
+            !repository.observeTransactions(isDemo = false).first().first { it.id == groceryTxId }.isReversed
+        )
+        vm.dismissPendingAiConfirmation()
+
+        // Case 4: Explicitly requested latest transaction ("reverse last transaction") -> stages confirmation preview
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "reverse last transaction"
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { vm.pendingAiConfirmation.value != null }
+        assertEquals(groceryTxId, vm.pendingAiConfirmation.value?.targetTransactionIdToReverse)
+        vm.dismissPendingAiConfirmation()
+
+        // Add a second grocery transaction to test multiple matching transactions
+        val secondGroceryTxId = repository.recordTransaction(
+            transactionType = TransactionType.EXPENSE,
+            dateEpochDay = 502L,
+            amountPaise = 1_200_00L,
+            sourceAccountId = bankId,
+            category = "Household & Groceries",
+            description = "Reliance Fresh Weekend",
+            isDemo = false
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+            vm.uiState.value.transactions.any { it.id == secondGroceryTxId }
+        }
+
+        // Case 5: Multiple matching transactions -> prompts disambiguation, does not auto-stage
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "delete Reliance Fresh transaction"
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { vm.pendingVoiceDisambiguation.value != null }
+        org.junit.Assert.assertNull(vm.pendingAiConfirmation.value)
+        assertTrue(vm.pendingVoiceDisambiguation.value!!.options.size >= 2)
+
+        // Selecting an option from disambiguation stages the confirmation preview, and confirming reverses via journal entry
+        val chosenOpt = vm.pendingVoiceDisambiguation.value!!.options.first()
+        vm.selectVoiceDisambiguationOption(chosenOpt) { _, _, _ -> }
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { vm.pendingAiConfirmation.value != null }
+        var confirmReply = ""
+        vm.confirmPendingAiTransaction(context) { confirmReply = it }
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { confirmReply.isNotBlank() }
+
+        // Verify original history is preserved with isReversed = true and a REVERSAL journal entry
+        val allTxsAfterReversal = repository.observeTransactions(isDemo = false).first()
+        val reversedTx = allTxsAfterReversal.first { it.id == chosenOpt.entityId }
+        assertTrue(reversedTx.isReversed)
+        val journalEntries = repository.observeJournalEntries(isDemo = false).first()
+        assertTrue(journalEntries.any { it.isReversal })
+
+        // Case 6: No matching transactions when multiple transactions exist -> asks for clarification
+        var replyNoMatch = ""
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "delete Uber flight transaction of 99999",
+            onFinished = { reply, _, _ -> replyNoMatch = reply }
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { replyNoMatch.isNotBlank() }
+        org.junit.Assert.assertNull(vm.pendingAiConfirmation.value)
+        assertTrue(replyNoMatch.contains("No transaction matched", ignoreCase = true))
+    }
+
+    @Test
+    fun `missing financial amounts in voice commands prompt user instead of inventing 100 rupees and require explicit confirmation`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        repository.ensureInitialized()
+        repository.createAccount(
+            name = "SBI Savings",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 40_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 600L,
+            isDemo = false
+        )
+
+        val vm = com.example.ui.FinanceVaultViewModel(repository)
+        composeTestRule.setContent {
+            com.example.ui.theme.MyApplicationTheme {
+                FinanceVaultApp(viewModel = vm)
+            }
+        }
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) {
+            !vm.uiState.value.isInitializing && vm.uiState.value.accountsWithBalances.isNotEmpty()
+        }
+
+        // Voice command for gift card without an amount must NOT invent ₹100 (10000L); it must ask for the amount
+        var promptReply = ""
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "add gift card Amazon",
+            onFinished = { reply, _, _ -> promptReply = reply }
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { promptReply.isNotBlank() }
+        assertTrue("Gift cards must remain empty when amount is missing", repository.observeGiftCards(false).first().isEmpty())
+        org.junit.Assert.assertNull(vm.pendingAiConfirmation.value)
+        org.junit.Assert.assertNotNull(
+            "Missing amount must trigger a follow-up prompt",
+            vm.pendingVoiceDisambiguation.value?.onSpokenAmountProvided
+        )
+
+        // User speaks the missing amount "2500 rupees" -> stages confirmation preview without saving yet
+        vm.executeVoiceOrGeminiCommand(
+            context = context,
+            utterance = "2500 rupees"
+        )
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { vm.pendingAiConfirmation.value != null }
+        assertTrue("Gift card must not be saved before user confirms", repository.observeGiftCards(false).first().isEmpty())
+        assertEquals(2_500_00L, vm.pendingAiConfirmation.value?.amountPaise)
+        assertEquals("ADD_GIFT_CARD", vm.pendingAiConfirmation.value?.operationType)
+
+        // Confirming commits the ₹2,500 gift card
+        var commitReply = ""
+        vm.confirmPendingAiTransaction(context) { commitReply = it }
+        composeTestRule.waitUntil(timeoutMillis = 5_000L) { commitReply.isNotBlank() }
+        val savedCards = repository.observeGiftCards(false).first()
+        assertEquals(1, savedCards.size)
+        assertEquals(2_500_00L, savedCards.first().initialValuePaise)
+    }
+
+    @Test
+    fun `demo and real data modes are strictly isolated and reject cross-mode references`() = runBlocking {
+        repository.ensureInitialized()
+        repository.setDemonstrationMode(true)
+
+        val realBankId = repository.createAccount(
+            name = "Real Isolated Bank",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 10_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 700L,
+            isDemo = false
+        )
+        val demoBankId = repository.observeAccounts(isDemo = true).first().first().id
+        val demoInvId = repository.observeInvestments(isDemo = true).first().first().id
+        val demoLoanId = repository.observeLoans(isDemo = true).first().first().id
+        val demoGiftCardId = repository.observeGiftCards(isDemo = true).first().first().id
+
+        // 1. Attempting to record a Real transaction using a Demo source account must be rejected
+        val crossAccountFailure = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.EXPENSE,
+                dateEpochDay = 701L,
+                amountPaise = 500_00L,
+                sourceAccountId = demoBankId,
+                category = "Food & Dining",
+                description = "Cross-mode attempt",
+                isDemo = false
+            )
+        }
+        assertTrue("Cross-mode account reference must be rejected", crossAccountFailure.isFailure)
+
+        // 2. Attempting to link a Demo investment to a Real transaction must be rejected
+        val crossInvestmentFailure = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.INVESTMENT_PURCHASE,
+                dateEpochDay = 701L,
+                amountPaise = 1_000_00L,
+                sourceAccountId = realBankId,
+                category = "Investments",
+                description = "Cross-mode investment attempt",
+                linkedInvestmentId = demoInvId,
+                isDemo = false
+            )
+        }
+        assertTrue("Cross-mode investment reference must be rejected", crossInvestmentFailure.isFailure)
+
+        // 3. Attempting to link a Demo loan to a Real EMI transaction must be rejected
+        val crossLoanFailure = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.LOAN_REPAYMENT,
+                dateEpochDay = 701L,
+                amountPaise = 1_500_00L,
+                principalComponentPaise = 1_000_00L,
+                interestComponentPaise = 500_00L,
+                sourceAccountId = realBankId,
+                category = "Loan EMI",
+                description = "Cross-mode loan attempt",
+                linkedLoanId = demoLoanId,
+                isDemo = false
+            )
+        }
+        assertTrue("Cross-mode loan reference must be rejected", crossLoanFailure.isFailure)
+
+        // 4. Attempting to link a Demo gift card to a Real transaction must be rejected
+        val crossGiftCardFailure = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.GIFT_CARD_USAGE,
+                dateEpochDay = 701L,
+                amountPaise = 200_00L,
+                category = "Shopping",
+                description = "Cross-mode gift card attempt",
+                linkedGiftCardId = demoGiftCardId,
+                isDemo = false
+            )
+        }
+        assertTrue("Cross-mode gift card reference must be rejected", crossGiftCardFailure.isFailure)
+    }
+
+    @Test
+    fun `versioned JSON backup supports AES-256-GCM encryption, SHA-256 integrity validation, and full multi-entity round trip`() = runBlocking {
+        repository.ensureInitialized()
+        repository.setSecurityPin("9876")
+        val bankId = repository.createAccount(
+            name = "Vault Encrypted Bank",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 1_00_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 800L,
+            isDemo = false
+        )
+        repository.addInvestment(
+            name = "Sovereign Gold Bond",
+            category = InvestmentCategory.GOLD,
+            purchaseDateEpochDay = 801L,
+            quantity = 5.0,
+            units = 5.0,
+            purchasePricePerUnitPaise = 6_000_00L,
+            investedAmountPaise = 30_000_00L,
+            paymentAccountId = bankId,
+            isDemo = false
+        )
+        repository.addSubscription(
+            name = "Cloud Storage Pro",
+            costPaise = 499_00L,
+            billingFrequency = com.example.data.local.BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = 830L,
+            paymentAccountId = bankId,
+            notes = "Annual tier",
+            isDemo = false
+        )
+        repository.addGoal(
+            name = "Emergency Reserve",
+            goalType = com.example.data.local.GoalType.EMERGENCY_FUND,
+            targetAmountPaise = 5_00_000_00L,
+            currentSavedPaise = 25_000_00L,
+            targetDateEpochDay = 1200L,
+            linkedAccountId = bankId,
+            notes = "6 months runway",
+            isDemo = false
+        )
+        repository.addTaxRecord(
+            taxType = com.example.data.local.TaxType.ADVANCE_TAX,
+            financialYear = "FY 2026-27",
+            amountPaidPaise = 15_000_00L,
+            paymentDateEpochDay = 802L,
+            challanNumber = "CHALLAN-99",
+            paymentAccountId = bankId,
+            notes = "Q1 Advance Tax",
+            isDemo = false
+        )
+
+        // Export with password encryption
+        val encryptedBackup = repository.createJsonBackupString(password = "StrongVaultPass!23")
+        // Verify plaintext secrets and entity names are not leaked in ciphertext envelope
+        assertTrue(!encryptedBackup.contains("pinHashSha256"))
+        assertTrue(!encryptedBackup.contains("Sovereign Gold Bond"))
+
+        // Inspect with wrong password -> fails cleanly
+        val wrongPassInspect = runCatching {
+            repository.inspectJsonBackup(encryptedBackup, password = "WrongPassword")
+        }
+        assertTrue(wrongPassInspect.isFailure)
+
+        // Inspect with right password -> returns accurate preview
+        val preview = repository.inspectJsonBackup(encryptedBackup, password = "StrongVaultPass!23")
+        assertTrue(preview.isEncrypted)
+        assertTrue(preview.checksumVerified)
+        assertEquals(1, preview.accountsCount)
+        assertEquals(1, preview.investmentsCount)
+        assertEquals(1, preview.subscriptionsCount)
+        assertEquals(1, preview.goalsCount)
+        assertEquals(1, preview.taxRecordsCount)
+
+        // Clear all real data and restore with REPLACE_EXISTING
+        repository.clearAllDataForMode(isDemo = false)
+        assertTrue(repository.observeInvestments(isDemo = false).first().isEmpty())
+
+        repository.restoreFromJsonBackup(
+            jsonString = encryptedBackup,
+            password = "StrongVaultPass!23",
+            mode = com.example.data.repository.BackupRestoreMode.REPLACE_EXISTING
+        )
+
+        assertEquals(1, repository.observeAccounts(isDemo = false).first().size)
+        assertEquals(1, repository.observeInvestments(isDemo = false).first().size)
+        assertEquals(1, repository.observeSubscriptions(isDemo = false).first().size)
+        assertEquals(1, repository.observeGoals(isDemo = false).first().size)
+        assertEquals(1, repository.observeTaxRecords(isDemo = false).first().size)
+        assertEquals("Sovereign Gold Bond", repository.observeInvestments(isDemo = false).first().first().name)
+        assertEquals(30_000_00L, repository.observeInvestments(isDemo = false).first().first().investedAmountPaise)
+
+        val ledgers = repository.observeLedgerAccounts(isDemo = false).first()
+        val lines = repository.observeJournalLines(isDemo = false).first()
+        val tb = FinancialReportGenerator.generateTrialBalance(ledgers, lines)
+        val bs = FinancialReportGenerator.generateBalanceSheet(ledgers, lines)
+        assertTrue(tb.isAgreed)
+        assertTrue(bs.isReconciled)
+        assertEquals(55_000_00L, bs.currentBankBalancesPaise) // 1,00,000 - 30,000 inv - 15,000 tax
+        assertEquals(30_000_00L, bs.nonCurrentInvestmentsPaise)
+    }
+
+    @Test
+    fun `accounting validation enforces cost basis cap, cumulative refund cap, loan principal cap, and resilient enum converters`() = runBlocking {
+        repository.ensureInitialized()
+        val bankId = repository.createAccount(
+            name = "Validation Bank",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 2_00_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 900L,
+            isDemo = false
+        )
+        val invId = repository.addInvestment(
+            name = "Bluechip Equity",
+            category = InvestmentCategory.EQUITY_SHARES,
+            purchaseDateEpochDay = 901L,
+            quantity = 10.0,
+            units = 10.0,
+            purchasePricePerUnitPaise = 1_000_00L,
+            investedAmountPaise = 10_000_00L,
+            paymentAccountId = bankId,
+            isDemo = false
+        )
+
+        // 1. Disposing more cost basis than remaining holding cost basis must fail
+        val excessiveCostBasis = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.INVESTMENT_SALE,
+                dateEpochDay = 902L,
+                amountPaise = 15_000_00L,
+                costBasisDisposedPaise = 12_000_00L, // > 10,000_00L invested
+                destinationAccountId = bankId,
+                category = "Investment Sale",
+                description = "Over-disposal attempt",
+                linkedInvestmentId = invId,
+                isDemo = false
+            )
+        }
+        assertTrue("Disposing more than invested cost basis must fail", excessiveCostBasis.isFailure)
+
+        // 2. Cumulative refunds exceeding original expense amount must fail
+        val expenseTxId = repository.recordTransaction(
+            transactionType = TransactionType.EXPENSE,
+            dateEpochDay = 903L,
+            amountPaise = 2_000_00L,
+            sourceAccountId = bankId,
+            category = "Shopping",
+            description = "Shoes Purchase",
+            isDemo = false
+        )
+        // First partial refund of ₹1,200 succeeds
+        repository.recordTransaction(
+            transactionType = TransactionType.REFUND_RECEIVED,
+            dateEpochDay = 904L,
+            amountPaise = 1_200_00L,
+            destinationAccountId = bankId,
+            category = "Refund",
+            description = "Partial Refund 1",
+            linkedOriginalTransactionId = expenseTxId,
+            isDemo = false
+        )
+        // Second refund of ₹1,000 (total ₹2,200 > ₹2,000) must fail
+        val excessiveRefund = runCatching {
+            repository.recordTransaction(
+                transactionType = TransactionType.REFUND_RECEIVED,
+                dateEpochDay = 905L,
+                amountPaise = 1_000_00L,
+                destinationAccountId = bankId,
+                category = "Refund",
+                description = "Excessive Refund 2",
+                linkedOriginalTransactionId = expenseTxId,
+                isDemo = false
+            )
+        }
+        assertTrue("Cumulative refunds exceeding original expense must fail", excessiveRefund.isFailure)
+
+        // 3. Resilient TypeConverters fallback gracefully on unknown enum strings
+        val converters = com.example.data.local.FinanceTypeConverters()
+        assertEquals(AccountType.OTHER, converters.toAccountType("CORRUPT_UNKNOWN_TYPE"))
+        assertEquals(TransactionType.EXPENSE, converters.toTransactionType("INVALID_TX_TYPE"))
+    }
 }
+
 

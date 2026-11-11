@@ -1,0 +1,8 @@
+{
+  "name": "Finance Vault",
+  "description": "Personal finance, double-entry accounting, and Indian financial statements vault.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -849,7 +849,9 @@ class FinanceVaultViewModel(
         annualInterestRatePercent: Double?,
         compoundingFrequency: CompoundingFrequency,
         durationMonths: Int?,
-        notes: String
+        notes: String,
+        dividendsReceivedPaise: Long = 0L,
+        interestEarnedPaise: Long = 0L
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
@@ -873,7 +875,9 @@ class FinanceVaultViewModel(
                     compoundingFrequency = compoundingFrequency,
                     durationMonths = durationMonths,
                     notes = notes,
-                    isDemo = uiState.value.settings.isDemoModeEnabled
+                    isDemo = uiState.value.settings.isDemoModeEnabled,
+                    dividendsReceivedPaise = dividendsReceivedPaise,
+                    interestEarnedPaise = interestEarnedPaise
                 )
             }.onSuccess {
                 _statusBannerMessage.value = "Investment '$name' recorded in portfolio & Balance Sheet."
@@ -883,10 +887,30 @@ class FinanceVaultViewModel(
         }
     }
 
-    fun updateInvestmentValuation(investmentId: Long, recordedValuePaise: Long?) {
+    fun updateInvestmentValuation(
+        investmentId: Long,
+        recordedValuePaise: Long?,
+        updatedUnits: Double? = null,
+        updatedBuyPricePerUnitPaise: Long? = null,
+        updatedAnnualRatePercent: Double? = null,
+        updatedCompounding: CompoundingFrequency? = null,
+        updatedDurationMonths: Int? = null,
+        updatedDividendsPaise: Long? = null,
+        updatedInterestPaise: Long? = null
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.updateInvestmentRecordedValue(investmentId, recordedValuePaise)
-            _statusBannerMessage.value = "Recorded investment valuation updated."
+            repository.updateInvestmentRecordedValue(
+                investmentId = investmentId,
+                newRecordedValuePaise = recordedValuePaise,
+                updatedUnits = updatedUnits,
+                updatedBuyPricePerUnitPaise = updatedBuyPricePerUnitPaise,
+                updatedAnnualRatePercent = updatedAnnualRatePercent,
+                updatedCompounding = updatedCompounding,
+                updatedDurationMonths = updatedDurationMonths,
+                updatedDividendsPaise = updatedDividendsPaise,
+                updatedInterestPaise = updatedInterestPaise
+            )
+            _statusBannerMessage.value = "Investment valuation & growth rate synced to Balance Sheet."
         }
     }
 

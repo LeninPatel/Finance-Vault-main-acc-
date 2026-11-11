@@ -1188,13 +1188,14 @@ fun FinanceVaultApp(
                         MainTab.INVESTMENTS -> {
                             InvestmentsScreen(
                                 uiState = uiState,
-                                onAddInvestment = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes ->
-                                    viewModel.addInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes)
+                                onAddInvestment = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise ->
+                                    viewModel.addInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise)
                                 },
-                                onUpdateRecordedValuation = { id, valPaise ->
-                                    viewModel.updateInvestmentValuation(id, valPaise)
+                                onUpdateRecordedValuation = { id, valPaise, units, buyPrice, rate, comp, dur, divPaise, intPaise ->
+                                    viewModel.updateInvestmentValuation(id, valPaise, units, buyPrice, rate, comp, dur, divPaise, intPaise)
                                 },
-                                onAddCustomOption = { scope, value -> viewModel.addCustomOption(scope, value) }
+                                onAddCustomOption = { scope, value -> viewModel.addCustomOption(scope, value) },
+                                onBack = { viewModel.selectTab(MainTab.HOME) }
                             )
                         }
 
@@ -1210,13 +1211,14 @@ fun FinanceVaultApp(
                                 MoreDestination.INVESTMENTS -> {
                                     InvestmentsScreen(
                                         uiState = uiState,
-                                        onAddInvestment = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes ->
-                                            viewModel.addInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes)
+                                        onAddInvestment = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise ->
+                                            viewModel.addInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise)
                                         },
-                                        onUpdateRecordedValuation = { id, valPaise ->
-                                            viewModel.updateInvestmentValuation(id, valPaise)
+                                        onUpdateRecordedValuation = { id, valPaise, units, buyPrice, rate, comp, dur, divPaise, intPaise ->
+                                            viewModel.updateInvestmentValuation(id, valPaise, units, buyPrice, rate, comp, dur, divPaise, intPaise)
                                         },
-                                        onAddCustomOption = { scope, value -> viewModel.addCustomOption(scope, value) }
+                                        onAddCustomOption = { scope, value -> viewModel.addCustomOption(scope, value) },
+                                        onBack = { viewModel.navigateMore(MoreDestination.HUB) }
                                     )
                                 }
 

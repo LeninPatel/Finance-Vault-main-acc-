@@ -24,7 +24,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Autorenew
@@ -37,6 +39,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -397,33 +400,74 @@ fun InvestmentsScreen(
         annualInterestRatePercent: Double?,
         compoundingFrequency: CompoundingFrequency,
         durationMonths: Int?,
-        notes: String
+        notes: String,
+        dividendsReceivedPaise: Long,
+        interestEarnedPaise: Long
     ) -> Unit,
-    onUpdateRecordedValuation: (Long, Long?) -> Unit,
-    onAddCustomOption: (String, String) -> Unit = { _, _ -> }
+    onUpdateRecordedValuation: (
+        investmentId: Long,
+        recordedValuePaise: Long?,
+        updatedUnits: Double?,
+        updatedBuyPricePerUnitPaise: Long?,
+        updatedAnnualRatePercent: Double?,
+        updatedCompounding: CompoundingFrequency?,
+        updatedDurationMonths: Int?,
+        updatedDividendsPaise: Long?,
+        updatedInterestPaise: Long?
+    ) -> Unit,
+    onAddCustomOption: (String, String) -> Unit = { _, _ -> },
+    onBack: () -> Unit = {}
 ) {
+    BackHandler { onBack() }
     var showAddDialog by remember { mutableStateOf(false) }
     var editingValuationInv by remember { mutableStateOf<InvestmentEntity?>(null) }
     val isHidden = uiState.settings.isPrivacyModeEnabled
 
-    val totalInvested = remember(uiState.investments) { uiState.investments.sumOf { it.investedAmountPaise } }
-    val hasAnyRecordedValuation = remember(uiState.investments) {
-        uiState.investments.any { it.isCurrentValueRecorded && it.currentRecordedValuePaise != null }
-    }
-    val totalCurrentRecorded = remember(uiState.investments) {
-        uiState.investments.sumOf {
-            if (it.isCurrentValueRecorded && it.currentRecordedValuePaise != null) it.currentRecordedValuePaise
-            else it.investedAmountPaise
+    val analysesById = remember(uiState.investments) {
+        val today = IndianFinancialYear.todayEpochDay()
+        uiState.investments.associate { inv ->
+            val holdingDays = (today - inv.purchaseDateEpochDay).coerceAtLeast(1L)
+            val derivedUnitCurPrice = if (inv.isCurrentValueRecorded && inv.currentRecordedValuePaise != null && inv.units > 0.0) {
+                (inv.currentRecordedValuePaise / inv.units).toLong()
+            } else null
+            inv.id to FinancialCalculators.analyzeInvestmentGrowth(
+                units = inv.units,
+                purchasePricePerUnitPaise = inv.purchasePricePerUnitPaise,
+                investedAmountPaise = inv.investedAmountPaise,
+                currentRecordedValuePaise = if (inv.isCurrentValueRecorded) inv.currentRecordedValuePaise else null,
+                isCurrentValueRecorded = inv.isCurrentValueRecorded,
+                currentUnitPricePaise = derivedUnitCurPrice,
+                annualGrowthOrInterestRatePercent = inv.annualInterestRatePercent,
+                compoundingPeriodsPerYear = inv.compoundingFrequency.periodsPerYear,
+                durationMonths = inv.durationMonths,
+                holdingDays = holdingDays,
+                chargesPaise = inv.chargesPaise,
+                dividendsAndInterestPaise = inv.dividendsReceivedPaise + inv.interestEarnedPaise,
+                isRecurringMonthly = inv.category == InvestmentCategory.RECURRING_DEPOSIT || inv.category == InvestmentCategory.SIP
+            )
         }
+    }
+
+    val totalInvested = remember(uiState.investments) { uiState.investments.sumOf { it.investedAmountPaise } }
+    val totalCurrentRecorded = remember(uiState.investments, analysesById) {
+        uiState.investments.sumOf { inv ->
+            analysesById[inv.id]?.effectiveCurrentValuePaise ?: inv.investedAmountPaise
+        }
+    }
+    val hasAnyRecordedValuation = remember(uiState.investments) {
+        uiState.investments.isNotEmpty()
     }
     val totalUnrealized = if (hasAnyRecordedValuation) totalCurrentRecorded - totalInvested else 0L
     val totalRealized = remember(uiState.investments) { uiState.investments.sumOf { it.realizedProfitLossPaise } }
     val totalInterestAndDiv = remember(uiState.investments) {
         uiState.investments.sumOf { it.interestEarnedPaise + it.dividendsReceivedPaise }
     }
+    val portfolioAbsReturn = remember(totalInvested, totalCurrentRecorded) {
+        if (totalInvested > 0L) FinancialCalculators.calculateAbsoluteReturnPercent(totalInvested, totalCurrentRecorded) else 0.0
+    }
 
-    // Portfolio XIRR from actual investment purchase cash flows and current recorded valuation
-    val portfolioXirr = remember(uiState.investments) {
+    // Portfolio XIRR from actual investment purchase cash flows and current valuation
+    val portfolioXirr = remember(uiState.investments, totalCurrentRecorded) {
         if (uiState.investments.isEmpty() || !hasAnyRecordedValuation) null
         else {
             val flows = mutableListOf<FinancialCalculators.CashFlowPoint>()
@@ -448,7 +492,23 @@ fun InvestmentsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("investments_back_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = VaultTextPrimary
+                        )
+                    }
                     Text(
                         text = "Investment Portfolio",
                         style = MaterialTheme.typography.headlineMedium,
@@ -490,11 +550,10 @@ fun InvestmentsScreen(
                             modifier = Modifier.weight(1f),
                             horizontalAlignment = Alignment.End
                         ) {
-                            Text("Recorded Value", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                            Text("Current Wealth Value", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
                             Text(
                                 text = when {
                                     uiState.investments.isEmpty() -> "Not recorded"
-                                    !hasAnyRecordedValuation -> "Awaiting valuation"
                                     else -> InrMoney.formatPaise(totalCurrentRecorded, isHidden = isHidden)
                                 },
                                 style = MaterialTheme.typography.titleLarge,
@@ -513,7 +572,7 @@ fun InvestmentsScreen(
                             Text("Unrealized P&L", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
                             Text(
                                 text = if (!hasAnyRecordedValuation) "Not recorded"
-                                else InrMoney.formatPaise(totalUnrealized, isHidden = isHidden),
+                                else "${InrMoney.formatPaise(totalUnrealized, isHidden = isHidden)} ($portfolioAbsReturn%)",
                                 style = MaterialTheme.typography.titleSmall,
                                 color = if (totalUnrealized >= 0) VaultEmerald else VaultCoral
                             )
@@ -543,7 +602,7 @@ fun InvestmentsScreen(
 
                     if (portfolioXirr != null) {
                         Text(
-                            text = "Portfolio Annualized XIRR: $portfolioXirr% p.a.",
+                            text = "Portfolio Annualized Growing Rate (XIRR): $portfolioXirr% p.a. • Synced to Balance Sheet Net Worth",
                             style = MaterialTheme.typography.labelMedium,
                             color = VaultEmerald
                         )
@@ -570,6 +629,7 @@ fun InvestmentsScreen(
             ) { inv ->
                 InvestmentHoldingCard(
                     inv = inv,
+                    analysis = analysesById[inv.id],
                     isHidden = isHidden,
                     onEditValuation = { editingValuationInv = inv }
                 )
@@ -585,8 +645,8 @@ fun InvestmentsScreen(
             customCategories = uiState.customOptionsMap["INVESTMENT_CATEGORY"].orEmpty(),
             onAddCustomCategory = { onAddCustomOption("INVESTMENT_CATEGORY", it) },
             onDismiss = { showAddDialog = false },
-            onSave = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes ->
-                onAddInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes)
+            onSave = { name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise ->
+                onAddInvestment(name, cat, date, qty, units, price, invested, charges, curVal, isCurRec, payAcc, rate, comp, dur, notes, divPaise, intPaise)
                 showAddDialog = false
             }
         )
@@ -594,41 +654,22 @@ fun InvestmentsScreen(
 
     if (editingValuationInv != null) {
         val target = editingValuationInv!!
-        var valInput by remember(target) {
-            mutableStateOf(
-                target.currentRecordedValuePaise?.let { InrMoney.paiseToPlainRupeeInput(it) } ?: ""
-            )
-        }
-        AlertDialog(
-            onDismissRequest = { editingValuationInv = null },
-            containerColor = VaultCardSurface,
-            title = { Text("Update Recorded Value: ${target.name}", color = VaultTextPrimary) },
-            text = {
-                OutlinedTextField(
-                    value = valInput,
-                    onValueChange = { valInput = it },
-                    label = { Text("Current Recorded Value (₹)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+        UpdateInvestmentValuationDialog(
+            inv = target,
+            onDismiss = { editingValuationInv = null },
+            onSave = { curValPaise, units, buyPricePaise, annualRate, compFreq, durMonths, divPaise, intPaise ->
+                onUpdateRecordedValuation(
+                    target.id,
+                    curValPaise,
+                    units,
+                    buyPricePaise,
+                    annualRate,
+                    compFreq,
+                    durMonths,
+                    divPaise,
+                    intPaise
                 )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val parsed = InrMoney.parseInrToPaise(valInput)
-                        onUpdateRecordedValuation(target.id, parsed)
-                        editingValuationInv = null
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = VaultEmerald)
-                ) {
-                    Text("Save Valuation")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { editingValuationInv = null }) {
-                    Text("Cancel", color = VaultTextSecondary)
-                }
+                editingValuationInv = null
             }
         )
     }
@@ -637,35 +678,21 @@ fun InvestmentsScreen(
 @Composable
 private fun InvestmentHoldingCard(
     inv: InvestmentEntity,
+    analysis: FinancialCalculators.InvestmentGrowthAnalysis?,
     isHidden: Boolean,
     onEditValuation: () -> Unit
 ) {
-    val isDeposit = inv.category == InvestmentCategory.FIXED_DEPOSIT || inv.category == InvestmentCategory.RECURRING_DEPOSIT
-    val projectedMaturity = remember(inv) {
-        if (isDeposit && inv.annualInterestRatePercent != null && inv.durationMonths != null) {
-            if (inv.category == InvestmentCategory.FIXED_DEPOSIT) {
-                FinancialCalculators.calculateFixedDepositMaturity(
-                    principalPaise = inv.investedAmountPaise,
-                    annualRatePercent = inv.annualInterestRatePercent,
-                    durationMonths = inv.durationMonths,
-                    compoundingPerYear = inv.compoundingFrequency.periodsPerYear
-                )
-            } else {
-                val monthlyInst = inv.investedAmountPaise / inv.durationMonths.coerceAtLeast(1)
-                FinancialCalculators.calculateRecurringDepositMaturity(
-                    monthlyInstallmentPaise = monthlyInst,
-                    annualRatePercent = inv.annualInterestRatePercent,
-                    tenureMonths = inv.durationMonths,
-                    compoundingPerYear = inv.compoundingFrequency.periodsPerYear
-                )
-            }
-        } else null
-    }
-
-    val holdingDays = (IndianFinancialYear.todayEpochDay() - inv.purchaseDateEpochDay).coerceAtLeast(1L)
-    val cagr = if (inv.isCurrentValueRecorded && inv.currentRecordedValuePaise != null) {
-        FinancialCalculators.calculateCagrPercent(inv.investedAmountPaise, inv.currentRecordedValuePaise, holdingDays)
-    } else null
+    val currentValPaise = analysis?.effectiveCurrentValuePaise
+        ?: if (inv.isCurrentValueRecorded && inv.currentRecordedValuePaise != null) inv.currentRecordedValuePaise else inv.investedAmountPaise
+    val currentUnitPricePaise = analysis?.currentPricePerUnitPaise
+        ?: if (inv.units > 0.0) (currentValPaise / inv.units).toLong() else currentValPaise
+    val diff = currentValPaise - inv.investedAmountPaise
+    val absRet = analysis?.absoluteReturnPercent
+        ?: FinancialCalculators.calculateAbsoluteReturnPercent(inv.investedAmountPaise, currentValPaise)
+    val cagr = analysis?.annualizedGrowthRatePercent ?: inv.annualInterestRatePercent ?: 0.0
+    val monthlyGrowth = analysis?.monthlyGrowthRatePercent ?: 0.0
+    val oneYrProj = analysis?.projectedOneYearValuePaise ?: currentValPaise
+    val matVal = analysis?.projectedMaturityValuePaise
 
     VaultGlassCard {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -696,7 +723,7 @@ private fun InvestmentHoldingCard(
                     Column(modifier = Modifier.weight(1f)) {
                         Text(inv.name, style = MaterialTheme.typography.titleMedium, color = VaultTextPrimary)
                         Text(
-                            text = "${inv.category.displayName} • Purchased ${IndianFinancialYear.formatEpochDay(inv.purchaseDateEpochDay)}",
+                            text = "${inv.category.displayName} • ${inv.units} units • Purchased ${IndianFinancialYear.formatEpochDay(inv.purchaseDateEpochDay)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = VaultTextSecondary
                         )
@@ -704,11 +731,12 @@ private fun InvestmentHoldingCard(
                 }
                 OutlinedButton(
                     onClick = onEditValuation,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.testTag("update_investment_value_${inv.id}")
                 ) {
                     Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(14.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Update Value", style = MaterialTheme.typography.labelSmall)
+                    Text("Calc / Edit", style = MaterialTheme.typography.labelSmall)
                 }
             }
 
@@ -719,60 +747,326 @@ private fun InvestmentHoldingCard(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column {
-                    Text("Invested Amount", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                    Text("Invested Capital", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
                     Text(
                         text = InrMoney.formatPaise(inv.investedAmountPaise, isHidden = isHidden),
                         style = MaterialTheme.typography.titleSmall,
                         color = VaultTextPrimary
                     )
+                    if (inv.purchasePricePerUnitPaise > 0L) {
+                        Text(
+                            text = "Buy @ ${InrMoney.formatPaise(inv.purchasePricePerUnitPaise, isHidden = isHidden)}/unit",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VaultTextMuted
+                        )
+                    }
                 }
                 Column {
-                    Text("Recorded Current Value", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                    Text("Current Value", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
                     Text(
-                        text = InrMoney.formatOptionalPaise(
-                            paise = inv.currentRecordedValuePaise,
-                            isRecorded = inv.isCurrentValueRecorded,
-                            missingLabel = "Not recorded",
-                            isHidden = isHidden
-                        ),
+                        text = InrMoney.formatPaise(currentValPaise, isHidden = isHidden),
                         style = MaterialTheme.typography.titleSmall,
                         color = VaultCyan
                     )
+                    if (currentUnitPricePaise > 0L) {
+                        Text(
+                            text = "Now @ ${InrMoney.formatPaise(currentUnitPricePaise, isHidden = isHidden)}/unit",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VaultCyan
+                        )
+                    }
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Text("Unrealized P&L", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
-                    if (inv.isCurrentValueRecorded && inv.currentRecordedValuePaise != null) {
-                        val diff = inv.currentRecordedValuePaise - inv.investedAmountPaise
-                        val absRet = FinancialCalculators.calculateAbsoluteReturnPercent(inv.investedAmountPaise, inv.currentRecordedValuePaise)
-                        Text(
-                            text = "${InrMoney.formatPaise(diff, isHidden = isHidden)} ($absRet%)",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = if (diff >= 0) VaultEmerald else VaultCoral
-                        )
-                    } else {
-                        Text("Not recorded", style = MaterialTheme.typography.titleSmall, color = VaultTextMuted)
-                    }
+                    Text("Unrealized Gain", style = MaterialTheme.typography.labelSmall, color = VaultTextSecondary)
+                    Text(
+                        text = "${InrMoney.formatPaise(diff, isHidden = isHidden)} ($absRet%)",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (diff >= 0) VaultEmerald else VaultCoral
+                    )
+                    Text(
+                        text = "Growth: $cagr% p.a.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (cagr >= 0.0) VaultEmerald else VaultCoral
+                    )
                 }
             }
 
-            if (cagr != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
                 Text(
-                    text = "CAGR: $cagr% p.a.",
+                    text = "Growing Rate: $cagr% p.a. (${monthlyGrowth}% / mo)",
                     style = MaterialTheme.typography.labelSmall,
                     color = VaultEmerald
                 )
+                Text(
+                    text = "1-Yr Projected: ${InrMoney.formatPaise(oneYrProj, isHidden = isHidden)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = VaultGold
+                )
             }
 
-            if (projectedMaturity != null) {
-                val (matPaise, projInterestPaise) = projectedMaturity
+            if (matVal != null && inv.durationMonths != null) {
                 Text(
-                    text = "Projected Maturity (${inv.annualInterestRatePercent}% p.a., ${inv.compoundingFrequency.displayName}): ${InrMoney.formatPaise(matPaise, isHidden = isHidden)} (Projected Interest: ${InrMoney.formatPaise(projInterestPaise, isHidden = isHidden)})",
+                    text = "Maturity Value (${inv.durationMonths}m @ ${inv.annualInterestRatePercent ?: cagr}% ${inv.compoundingFrequency.displayName}): ${InrMoney.formatPaise(matVal, isHidden = isHidden)}",
                     style = MaterialTheme.typography.labelSmall,
                     color = VaultGold
                 )
             }
         }
     }
+}
+
+@Composable
+private fun UpdateInvestmentValuationDialog(
+    inv: InvestmentEntity,
+    onDismiss: () -> Unit,
+    onSave: (
+        recordedValuePaise: Long?,
+        updatedUnits: Double?,
+        updatedBuyPricePerUnitPaise: Long?,
+        updatedAnnualRatePercent: Double?,
+        updatedCompounding: CompoundingFrequency?,
+        updatedDurationMonths: Int?,
+        updatedDividendsPaise: Long?,
+        updatedInterestPaise: Long?
+    ) -> Unit
+) {
+    val today = IndianFinancialYear.todayEpochDay()
+    val holdingDays = (today - inv.purchaseDateEpochDay).coerceAtLeast(1L)
+
+    var unitsInput by remember(inv) { mutableStateOf(inv.units.toString()) }
+    var buyUnitPriceInput by remember(inv) {
+        mutableStateOf(
+            if (inv.purchasePricePerUnitPaise > 0L) InrMoney.paiseToPlainRupeeInput(inv.purchasePricePerUnitPaise) else ""
+        )
+    }
+    var currentUnitPriceInput by remember(inv) {
+        val curUnit = if (inv.isCurrentValueRecorded && inv.currentRecordedValuePaise != null && inv.units > 0.0) {
+            (inv.currentRecordedValuePaise / inv.units).toLong()
+        } else 0L
+        mutableStateOf(if (curUnit > 0L) InrMoney.paiseToPlainRupeeInput(curUnit) else "")
+    }
+    var valInput by remember(inv) {
+        mutableStateOf(
+            inv.currentRecordedValuePaise?.let { InrMoney.paiseToPlainRupeeInput(it) } ?: ""
+        )
+    }
+    var rateInput by remember(inv) {
+        mutableStateOf(inv.annualInterestRatePercent?.toString() ?: "")
+    }
+    var durationMonthsInput by remember(inv) {
+        mutableStateOf(inv.durationMonths?.toString() ?: "")
+    }
+    var compounding by remember(inv) { mutableStateOf(inv.compoundingFrequency) }
+    var dividendsInput by remember(inv) {
+        mutableStateOf(if (inv.dividendsReceivedPaise > 0L) InrMoney.paiseToPlainRupeeInput(inv.dividendsReceivedPaise) else "")
+    }
+    var interestInput by remember(inv) {
+        mutableStateOf(if (inv.interestEarnedPaise > 0L) InrMoney.paiseToPlainRupeeInput(inv.interestEarnedPaise) else "")
+    }
+
+    val parsedUnits = unitsInput.toDoubleOrNull()?.coerceAtLeast(0.0001) ?: inv.units
+    val parsedBuyUnitPaise = InrMoney.parseInrToPaise(buyUnitPriceInput) ?: inv.purchasePricePerUnitPaise
+    val parsedCurUnitPaise = InrMoney.parseInrToPaise(currentUnitPriceInput)
+    val parsedTotalCurPaise = InrMoney.parseInrToPaise(valInput)
+    val parsedRate = rateInput.toDoubleOrNull()
+    val parsedDuration = durationMonthsInput.toIntOrNull()
+    val parsedDivPaise = InrMoney.parseInrToPaise(dividendsInput) ?: 0L
+    val parsedIntPaise = InrMoney.parseInrToPaise(interestInput) ?: 0L
+
+    val liveAnalysis = remember(
+        inv, parsedUnits, parsedBuyUnitPaise, parsedCurUnitPaise, parsedTotalCurPaise,
+        parsedRate, compounding, parsedDuration, parsedDivPaise, parsedIntPaise
+    ) {
+        FinancialCalculators.analyzeInvestmentGrowth(
+            units = parsedUnits,
+            purchasePricePerUnitPaise = parsedBuyUnitPaise,
+            investedAmountPaise = inv.investedAmountPaise,
+            currentRecordedValuePaise = parsedTotalCurPaise,
+            isCurrentValueRecorded = parsedTotalCurPaise != null && parsedTotalCurPaise > 0L,
+            currentUnitPricePaise = parsedCurUnitPaise,
+            annualGrowthOrInterestRatePercent = parsedRate,
+            compoundingPeriodsPerYear = compounding.periodsPerYear,
+            durationMonths = parsedDuration,
+            holdingDays = holdingDays,
+            chargesPaise = inv.chargesPaise,
+            dividendsAndInterestPaise = parsedDivPaise + parsedIntPaise,
+            isRecurringMonthly = inv.category == InvestmentCategory.RECURRING_DEPOSIT || inv.category == InvestmentCategory.SIP
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = VaultCardSurface,
+        title = { Text("Valuation & Growth Calculator: ${inv.name}", color = VaultTextPrimary) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = unitsInput,
+                        onValueChange = { unitsInput = it },
+                        label = { Text("Shares / Units") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = buyUnitPriceInput,
+                        onValueChange = { buyUnitPriceInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Buy Price / Unit (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = currentUnitPriceInput,
+                        onValueChange = {
+                            currentUnitPriceInput = InrMoney.sanitizeIndianNumericInput(it)
+                            val unitP = InrMoney.parseInrToPaise(currentUnitPriceInput)
+                            if (unitP != null && parsedUnits > 0.0) {
+                                valInput = InrMoney.paiseToPlainRupeeInput((unitP * parsedUnits).toLong())
+                            }
+                        },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Current Share/NAV (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = valInput,
+                        onValueChange = { valInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Current Total Value (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = rateInput,
+                        onValueChange = { rateInput = it },
+                        label = { Text("Annual Growth/Int (% p.a.)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = durationMonthsInput,
+                        onValueChange = { durationMonthsInput = it },
+                        label = { Text("Tenure (Months)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                VaultChooseSelector(
+                    label = "Compounding Frequency",
+                    selectedItem = compounding,
+                    options = CompoundingFrequency.entries,
+                    onSelect = { compounding = it },
+                    itemLabel = { it.displayName },
+                    itemIcon = { Icons.Default.Autorenew },
+                    placeholder = "Choose"
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = dividendsInput,
+                        onValueChange = { dividendsInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Dividends Received (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = interestInput,
+                        onValueChange = { interestInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Interest Earned (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                VaultGlassCard(accentColor = VaultEmerald) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "LIVE VALUATION & GROWING RATE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = VaultEmerald
+                        )
+                        Text(
+                            text = "Calculated Current Value: ${InrMoney.formatPaise(liveAnalysis.effectiveCurrentValuePaise)}",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = VaultCyan
+                        )
+                        Text(
+                            text = "Current Share/Unit Value: ${InrMoney.formatPaise(liveAnalysis.currentPricePerUnitPaise)} / unit",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VaultTextPrimary
+                        )
+                        Text(
+                            text = "Annualized Growing Rate (CAGR): ${liveAnalysis.annualizedGrowthRatePercent}% p.a. (${liveAnalysis.monthlyGrowthRatePercent}% / mo)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VaultEmerald
+                        )
+                        Text(
+                            text = "Absolute Return: ${liveAnalysis.absoluteReturnPercent}% • Net Gain: ${InrMoney.formatPaise(liveAnalysis.totalNetGainPaise)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (liveAnalysis.totalNetGainPaise >= 0) VaultEmerald else VaultCoral
+                        )
+                        Text(
+                            text = "1-Year Projected Value: ${InrMoney.formatPaise(liveAnalysis.projectedOneYearValuePaise)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VaultGold
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(
+                        liveAnalysis.effectiveCurrentValuePaise,
+                        parsedUnits,
+                        parsedBuyUnitPaise,
+                        parsedRate ?: liveAnalysis.annualizedGrowthRatePercent,
+                        compounding,
+                        parsedDuration,
+                        parsedDivPaise,
+                        parsedIntPaise
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = VaultEmerald)
+            ) {
+                Text("Sync Valuation & Growth")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = VaultTextSecondary)
+            }
+        }
+    )
 }
 
 @Composable
@@ -796,7 +1090,9 @@ private fun AddInvestmentDialog(
         annualInterestRatePercent: Double?,
         compoundingFrequency: CompoundingFrequency,
         durationMonths: Int?,
-        notes: String
+        notes: String,
+        dividendsReceivedPaise: Long,
+        interestEarnedPaise: Long
     ) -> Unit
 ) {
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -809,13 +1105,18 @@ private fun AddInvestmentDialog(
     // Always start unselected on "Choose" (null) — never pre-select a default!
     var category by remember { mutableStateOf<InvestmentCategory?>(null) }
     var customCategoryLabel by remember { mutableStateOf("") }
-    var investedInput by remember { mutableStateOf("") }
-    var currentValInput by remember { mutableStateOf("") }
+    var holdingDaysInput by remember { mutableStateOf("365") }
     var unitsInput by remember { mutableStateOf("1") }
+    var buyUnitPriceInput by remember { mutableStateOf("") }
+    var investedInput by remember { mutableStateOf("") }
+    var currentUnitPriceInput by remember { mutableStateOf("") }
+    var currentValInput by remember { mutableStateOf("") }
     var chargesInput by remember { mutableStateOf("") }
+    var dividendsInput by remember { mutableStateOf("") }
+    var interestInput by remember { mutableStateOf("") }
     var selectedAccountId by remember { mutableStateOf<Long?>(null) }
     var rateInput by remember { mutableStateOf("") }
-    var durationMonthsInput by remember { mutableStateOf("") }
+    var durationMonthsInput by remember { mutableStateOf("12") }
     var compounding by remember { mutableStateOf<CompoundingFrequency?>(null) }
     var notes by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -824,7 +1125,41 @@ private fun AddInvestmentDialog(
     val nameFocusRequester = remember { FocusRequester() }
     val amountFocusRequester = remember { FocusRequester() }
 
-    val isDeposit = category == InvestmentCategory.FIXED_DEPOSIT || category == InvestmentCategory.RECURRING_DEPOSIT || category == InvestmentCategory.BONDS
+    val parsedHoldingDays = holdingDaysInput.toLongOrNull()?.coerceAtLeast(1L) ?: 365L
+    val parsedUnits = unitsInput.toDoubleOrNull()?.coerceAtLeast(0.0001) ?: 1.0
+    val parsedBuyUnitPaise = InrMoney.parseInrToPaise(buyUnitPriceInput)
+    val parsedInvestedPaise = InrMoney.parseInrToPaise(investedInput)
+        ?: if (parsedBuyUnitPaise != null && parsedBuyUnitPaise > 0L) (parsedBuyUnitPaise * parsedUnits).toLong() else 0L
+    val parsedCurUnitPaise = InrMoney.parseInrToPaise(currentUnitPriceInput)
+    val parsedCurTotalPaise = InrMoney.parseInrToPaise(currentValInput)
+    val parsedChargesPaise = InrMoney.parseInrToPaise(chargesInput) ?: 0L
+    val parsedDivPaise = InrMoney.parseInrToPaise(dividendsInput) ?: 0L
+    val parsedIntPaise = InrMoney.parseInrToPaise(interestInput) ?: 0L
+    val parsedRate = rateInput.toDoubleOrNull()
+    val parsedDurMonths = durationMonthsInput.toIntOrNull()
+
+    val livePreview = remember(
+        category, parsedInvestedPaise, parsedUnits, parsedBuyUnitPaise,
+        parsedCurUnitPaise, parsedCurTotalPaise, parsedRate, parsedHoldingDays,
+        compounding, parsedDurMonths, parsedChargesPaise, parsedDivPaise, parsedIntPaise
+    ) {
+        if (parsedInvestedPaise <= 0L) null
+        else FinancialCalculators.analyzeInvestmentGrowth(
+            units = parsedUnits,
+            purchasePricePerUnitPaise = parsedBuyUnitPaise ?: (parsedInvestedPaise / parsedUnits).toLong(),
+            investedAmountPaise = parsedInvestedPaise,
+            currentRecordedValuePaise = parsedCurTotalPaise,
+            isCurrentValueRecorded = parsedCurTotalPaise != null && parsedCurTotalPaise > 0L,
+            currentUnitPricePaise = parsedCurUnitPaise,
+            annualGrowthOrInterestRatePercent = parsedRate,
+            compoundingPeriodsPerYear = (compounding ?: CompoundingFrequency.QUARTERLY).periodsPerYear,
+            durationMonths = parsedDurMonths,
+            holdingDays = parsedHoldingDays,
+            chargesPaise = parsedChargesPaise,
+            dividendsAndInterestPaise = parsedDivPaise + parsedIntPaise,
+            isRecurringMonthly = category == InvestmentCategory.RECURRING_DEPOSIT || category == InvestmentCategory.SIP
+        )
+    }
 
     fun submitInvestment() {
         keyboardController?.hide()
@@ -844,52 +1179,52 @@ private fun AddInvestmentDialog(
             }
             return
         }
-        val invPaise = InrMoney.parseInrToPaise(investedInput)
-        if (invPaise == null || invPaise <= 0L) {
+        val invPaise = parsedInvestedPaise
+        if (invPaise <= 0L) {
             highlightMissing = true
-            errorMsg = "Please enter a valid invested amount > ₹0."
+            errorMsg = "Please enter a valid invested amount or buy price > ₹0."
             scope.launch {
                 runCatching { amountFocusRequester.requestFocus() }
                 keyboardController?.show()
             }
             return
         }
-        val curPaise = InrMoney.parseInrToPaise(currentValInput)
-        val units = unitsInput.toDoubleOrNull()?.coerceAtLeast(0.0001) ?: 1.0
-        val pricePerUnit = (invPaise / units).toLong()
-        val charges = InrMoney.parseInrToPaise(chargesInput) ?: 0L
-        val rate = rateInput.toDoubleOrNull()
-        val dur = durationMonthsInput.toIntOrNull()
+        val pricePerUnit = parsedBuyUnitPaise ?: (invPaise / parsedUnits).toLong()
+        val computedCurVal = livePreview?.effectiveCurrentValuePaise ?: parsedCurTotalPaise
+        val hasCurrentVal = computedCurVal != null && computedCurVal > 0L
         val finalNotes = if (customCategoryLabel.isNotBlank()) customCategoryLabel else notes
+        val purchaseDateEpoch = (IndianFinancialYear.todayEpochDay() - parsedHoldingDays).coerceAtLeast(1L)
 
         onSave(
             name,
             chosenCategory,
-            IndianFinancialYear.todayEpochDay(),
-            units,
-            units,
+            purchaseDateEpoch,
+            parsedUnits,
+            parsedUnits,
             pricePerUnit,
             invPaise,
-            charges,
-            curPaise,
-            currentValInput.isNotBlank() && curPaise != null,
+            parsedChargesPaise,
+            computedCurVal,
+            hasCurrentVal,
             selectedAccountId,
-            rate,
+            parsedRate ?: livePreview?.annualizedGrowthRatePercent,
             compounding ?: CompoundingFrequency.QUARTERLY,
-            dur,
-            finalNotes
+            parsedDurMonths,
+            finalNotes,
+            parsedDivPaise,
+            parsedIntPaise
         )
     }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = VaultCardSurface,
-        title = { Text("Add Investment Holding", color = VaultTextPrimary) },
+        title = { Text("Add Investment & Calculate Growth", color = VaultTextPrimary) },
         text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 450.dp)
+                    .heightIn(max = 470.dp)
                     .dismissKeyboardOnSwipeDown()
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -921,8 +1256,8 @@ private fun AddInvestmentDialog(
                     value = name,
                     onValueChange = { name = it; errorMsg = null },
                     isError = highlightMissing && name.isBlank(),
-                    label = { Text("Investment Name (Required)") },
-                    placeholder = { Text("e.g. Nifty 50 Index Fund, 1-Yr Fixed Deposit") },
+                    label = { Text("Investment / Share Name (Required)") },
+                    placeholder = { Text("e.g. Reliance Shares, Nifty 50 SIP, SBI FD") },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submitInvestment() }),
                     singleLine = true,
@@ -932,13 +1267,50 @@ private fun AddInvestmentDialog(
                         .testTag("investment_name_input")
                 )
 
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = unitsInput,
+                        onValueChange = {
+                            unitsInput = it
+                            val u = it.toDoubleOrNull()
+                            val bp = InrMoney.parseInrToPaise(buyUnitPriceInput)
+                            if (u != null && u > 0.0 && bp != null && bp > 0L) {
+                                investedInput = InrMoney.paiseToPlainRupeeInput((u * bp).toLong())
+                            }
+                            val cp = InrMoney.parseInrToPaise(currentUnitPriceInput)
+                            if (u != null && u > 0.0 && cp != null && cp > 0L) {
+                                currentValInput = InrMoney.paiseToPlainRupeeInput((u * cp).toLong())
+                            }
+                        },
+                        label = { Text("Shares / Units / Qty") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = buyUnitPriceInput,
+                        onValueChange = {
+                            buyUnitPriceInput = InrMoney.sanitizeIndianNumericInput(it)
+                            val bp = InrMoney.parseInrToPaise(buyUnitPriceInput)
+                            if (bp != null && bp > 0L && parsedUnits > 0.0) {
+                                investedInput = InrMoney.paiseToPlainRupeeInput((bp * parsedUnits).toLong())
+                            }
+                        },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Buy Price / Share (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
                 OutlinedTextField(
                     value = investedInput,
                     onValueChange = {
                         investedInput = InrMoney.sanitizeIndianNumericInput(it)
                         errorMsg = null
                     },
-                    isError = highlightMissing && (InrMoney.parseInrToPaise(investedInput) ?: 0L) <= 0L,
+                    isError = highlightMissing && parsedInvestedPaise <= 0L,
                     visualTransformation = IndianCurrencyVisualTransformation,
                     label = { Text("Total Invested Amount in INR (₹)") },
                     keyboardOptions = KeyboardOptions(
@@ -953,24 +1325,60 @@ private fun AddInvestmentDialog(
                         .testTag("investment_amount_input")
                 )
 
-                OutlinedTextField(
-                    value = currentValInput,
-                    onValueChange = { currentValInput = InrMoney.sanitizeIndianNumericInput(it) },
-                    visualTransformation = IndianCurrencyVisualTransformation,
-                    label = { Text("Current Recorded Value (₹, Optional)") },
-                    placeholder = { Text("Leave blank if not yet known (never fabricated)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = { submitInvestment() }),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = currentUnitPriceInput,
+                        onValueChange = {
+                            currentUnitPriceInput = InrMoney.sanitizeIndianNumericInput(it)
+                            val cp = InrMoney.parseInrToPaise(currentUnitPriceInput)
+                            if (cp != null && cp > 0L && parsedUnits > 0.0) {
+                                currentValInput = InrMoney.paiseToPlainRupeeInput((cp * parsedUnits).toLong())
+                            }
+                        },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Current Share Price (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = currentValInput,
+                        onValueChange = { currentValInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Current Total Value (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { submitInvestment() }),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = unitsInput,
-                        onValueChange = { unitsInput = it },
-                        label = { Text("Units / Qty") },
+                        value = rateInput,
+                        onValueChange = { rateInput = it },
+                        label = { Text("Expected/Interest (% p.a.)") },
+                        placeholder = { Text("Auto-calc if blank") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = holdingDaysInput,
+                        onValueChange = { holdingDaysInput = it },
+                        label = { Text("Days Held So Far") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = durationMonthsInput,
+                        onValueChange = { durationMonthsInput = it },
+                        label = { Text("Target Tenure (Months)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
@@ -978,40 +1386,41 @@ private fun AddInvestmentDialog(
                         value = chargesInput,
                         onValueChange = { chargesInput = InrMoney.sanitizeIndianNumericInput(it) },
                         visualTransformation = IndianCurrencyVisualTransformation,
-                        label = { Text("Charges / Brokerage (₹)") },
+                        label = { Text("Brokerage / Charges (₹)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                 }
 
-                if (isDeposit) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = rateInput,
-                            onValueChange = { rateInput = it },
-                            label = { Text("Interest Rate (% p.a.)") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OutlinedTextField(
-                            value = durationMonthsInput,
-                            onValueChange = { durationMonthsInput = it },
-                            label = { Text("Tenure (Months)") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    VaultChooseSelector(
-                        label = "Compounding Frequency",
-                        selectedItem = compounding,
-                        options = CompoundingFrequency.entries,
-                        onSelect = { compounding = it },
-                        itemLabel = { it.displayName },
-                        itemIcon = { Icons.Default.Autorenew },
-                        placeholder = "Choose"
+                VaultChooseSelector(
+                    label = "Compounding Frequency",
+                    selectedItem = compounding,
+                    options = CompoundingFrequency.entries,
+                    onSelect = { compounding = it },
+                    itemLabel = { it.displayName },
+                    itemIcon = { Icons.Default.Autorenew },
+                    placeholder = "Choose (Default: Quarterly)"
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = dividendsInput,
+                        onValueChange = { dividendsInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Dividends Received (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = interestInput,
+                        onValueChange = { interestInput = InrMoney.sanitizeIndianNumericInput(it) },
+                        visualTransformation = IndianCurrencyVisualTransformation,
+                        label = { Text("Interest Earned (₹)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
                     )
                 }
 
@@ -1033,6 +1442,45 @@ private fun AddInvestmentDialog(
                     },
                     placeholder = "Choose"
                 )
+
+                if (livePreview != null) {
+                    VaultGlassCard(accentColor = VaultEmerald) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "CALCULATED CURRENT VALUE & GROWING RATE",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = VaultEmerald
+                            )
+                            Text(
+                                text = "Calculated Current Value: ${InrMoney.formatPaise(livePreview.effectiveCurrentValuePaise)}",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = VaultCyan
+                            )
+                            Text(
+                                text = "Current Share/Unit Value: ${InrMoney.formatPaise(livePreview.currentPricePerUnitPaise)} / unit",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = VaultTextPrimary
+                            )
+                            Text(
+                                text = "Growing Rate (CAGR): ${livePreview.annualizedGrowthRatePercent}% p.a. (${livePreview.monthlyGrowthRatePercent}% / mo)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = VaultEmerald
+                            )
+                            Text(
+                                text = "Absolute Return: ${livePreview.absoluteReturnPercent}% • 1-Yr Projected: ${InrMoney.formatPaise(livePreview.projectedOneYearValuePaise)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = VaultGold
+                            )
+                            if (livePreview.projectedMaturityValuePaise != null) {
+                                Text(
+                                    text = "Maturity Value: ${InrMoney.formatPaise(livePreview.projectedMaturityValuePaise)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = VaultGold
+                                )
+                            }
+                        }
+                    }
+                }
 
                 if (errorMsg != null) {
                     Text(text = errorMsg!!, color = VaultCoral, style = MaterialTheme.typography.bodySmall)

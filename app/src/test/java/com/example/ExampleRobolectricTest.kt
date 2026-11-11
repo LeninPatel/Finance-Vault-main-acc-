@@ -390,19 +390,32 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `demo mode seeds at least 12 current-month transactions while keeping real mode untouched`() = runBlocking {
+    fun `demo mode seeds 10+ items across every dashboard module and reconciles Balance Sheet Net Worth with investments`() = runBlocking {
         repository.ensureInitialized()
         repository.setDemonstrationMode(true)
 
         val realTxs = repository.observeTransactions(isDemo = false).first()
+        val demoAccounts = repository.observeAccounts(isDemo = true).first()
+        val demoInvestments = repository.observeInvestments(isDemo = true).first()
+        val demoSubscriptions = repository.observeSubscriptions(isDemo = true).first()
+        val demoGiftCards = repository.observeGiftCards(isDemo = true).first()
+        val demoBudgets = repository.observeBudgets(isDemo = true).first()
+        val demoGoals = repository.observeGoals(isDemo = true).first()
+        val demoLoans = repository.observeLoans(isDemo = true).first()
+        val demoTaxes = repository.observeTaxRecords(isDemo = true).first()
         val demoTxs = repository.observeTransactions(isDemo = true).first()
         val nonOpeningDemoTxs = demoTxs.filter { it.transactionType != TransactionType.OPENING_BALANCE }
 
         assertTrue(realTxs.isEmpty())
-        assertTrue("Expected at least 12 non-opening demo transactions, got ${nonOpeningDemoTxs.size}", nonOpeningDemoTxs.size >= 12)
-
-        val (monthStart, monthEnd) = com.example.domain.period.IndianFinancialYear.currentMonthRange()
-        assertTrue(demoTxs.all { it.dateEpochDay in monthStart..monthEnd })
+        assertTrue("Expected at least 10 demo accounts, got ${demoAccounts.size}", demoAccounts.size >= 10)
+        assertTrue("Expected at least 10 demo investments, got ${demoInvestments.size}", demoInvestments.size >= 10)
+        assertTrue("Expected at least 10 demo subscriptions, got ${demoSubscriptions.size}", demoSubscriptions.size >= 10)
+        assertTrue("Expected at least 10 demo gift cards, got ${demoGiftCards.size}", demoGiftCards.size >= 10)
+        assertTrue("Expected at least 10 demo budgets, got ${demoBudgets.size}", demoBudgets.size >= 10)
+        assertTrue("Expected at least 10 demo goals, got ${demoGoals.size}", demoGoals.size >= 10)
+        assertTrue("Expected at least 10 demo loans, got ${demoLoans.size}", demoLoans.size >= 10)
+        assertTrue("Expected at least 10 demo taxes, got ${demoTaxes.size}", demoTaxes.size >= 10)
+        assertTrue("Expected at least 20 non-opening demo transactions, got ${nonOpeningDemoTxs.size}", nonOpeningDemoTxs.size >= 20)
 
         val demoLedgers = repository.observeLedgerAccounts(isDemo = true).first()
         val demoLines = repository.observeJournalLines(isDemo = true).first()
@@ -410,6 +423,64 @@ class ExampleRobolectricTest {
         val bs = FinancialReportGenerator.generateBalanceSheet(demoLedgers, demoLines)
         assertTrue(tb.isAgreed)
         assertTrue(bs.isReconciled)
+
+        // Personal Net Worth on Balance Sheet includes Cash + Bank + Investments + Gift Cards - Liabilities
+        val totalRecordedInvestmentValue = demoInvestments.sumOf { it.currentRecordedValuePaise ?: it.investedAmountPaise }
+        assertEquals(totalRecordedInvestmentValue, bs.nonCurrentInvestmentsPaise)
+        assertTrue(bs.currentOtherAssetsPaise > 0L) // Includes gift cards
+        assertEquals(bs.totalAssetsPaise - bs.totalLiabilitiesPaise, bs.totalNetWorthPaise)
+    }
+
+    @Test
+    fun `investment growth calculator computes current share value and annualized growing rate and syncs to Balance Sheet`() = runBlocking {
+        repository.ensureInitialized()
+        val bankId = repository.createAccount(
+            name = "Wealth Bank",
+            accountType = AccountType.SAVINGS,
+            openingBalancePaise = 2_00_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = 100L,
+            isDemo = false
+        )
+
+        val today = com.example.domain.period.IndianFinancialYear.todayEpochDay()
+        val invId = repository.addInvestment(
+            name = "Growth Stock Ltd",
+            category = InvestmentCategory.EQUITY_SHARES,
+            purchaseDateEpochDay = today - 365L,
+            quantity = 20.0,
+            units = 20.0,
+            purchasePricePerUnitPaise = 1_000_00L,
+            investedAmountPaise = 20_000_00L,
+            currentRecordedValuePaise = 25_000_00L,
+            isCurrentValueRecorded = true,
+            paymentAccountId = bankId,
+            isDemo = false
+        )
+
+        val inv = repository.observeInvestments(isDemo = false).first().first { it.id == invId }
+        assertEquals(25_000_00L, inv.currentRecordedValuePaise)
+        assertEquals(25.0, inv.annualInterestRatePercent ?: 0.0, 0.5)
+
+        // Update valuation to ₹30,000 (₹1,500 per share)
+        repository.updateInvestmentRecordedValue(
+            investmentId = invId,
+            newRecordedValuePaise = 30_000_00L,
+            updatedUnits = 20.0,
+            updatedBuyPricePerUnitPaise = 1_000_00L
+        )
+
+        val ledgers = repository.observeLedgerAccounts(isDemo = false).first()
+        val lines = repository.observeJournalLines(isDemo = false).first()
+        val bs = FinancialReportGenerator.generateBalanceSheet(ledgers, lines)
+        val tb = FinancialReportGenerator.generateTrialBalance(ledgers, lines)
+
+        assertTrue(tb.isAgreed)
+        assertTrue(bs.isReconciled)
+        assertEquals(1_80_000_00L, bs.currentBankBalancesPaise)
+        assertEquals(30_000_00L, bs.nonCurrentInvestmentsPaise)
+        assertEquals(2_10_000_00L, bs.totalAssetsPaise)
+        assertEquals(2_10_000_00L, bs.totalNetWorthPaise)
     }
 }
 

@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for removing the top-right Add Transaction button from the Analytics & Financial Performance screen and expanding the isolated Demo Mode dataset with 12+ current-month transactions and automatic demo data upgrade.",
-  "updatedAt":  "2026-11-11T03:40:12.936113225Z",
+  "summary":  "Implementation plan for Balance Sheet-driven Personal Net Worth (including all investments, shares, gift cards, and wealth), a comprehensive Investment Growth Rate & Share Valuation Calculator, a top-left Back button in Investments & Portfolio, and 10+ Demo Mode records across every module and dashboard.",
+  "updatedAt":  "2026-11-11T04:05:58.889523837Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

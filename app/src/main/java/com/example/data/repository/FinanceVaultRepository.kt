@@ -970,8 +970,9 @@ class FinanceVaultRepository(
 
     /**
      * Adds an investment holding, creates its dedicated Investment Asset ledger account,
-     * and posts either an INVESTMENT_PURCHASE (if paid from a bank/cash account)
-     * or an OPENING_BALANCE entry (if existing holding brought into Finance Vault).
+     * posts either an INVESTMENT_PURCHASE (if paid from a bank/cash account)
+     * or an OPENING_BALANCE entry (if existing holding brought into Finance Vault),
+     * and synchronizes any valuation difference (from share price or growth rate) to the Balance Sheet.
      */
     suspend fun addInvestment(
         name: String,
@@ -990,10 +991,34 @@ class FinanceVaultRepository(
         compoundingFrequency: CompoundingFrequency = CompoundingFrequency.QUARTERLY,
         durationMonths: Int? = null,
         notes: String = "",
-        isDemo: Boolean = false
+        isDemo: Boolean = false,
+        dividendsReceivedPaise: Long = 0L,
+        interestEarnedPaise: Long = 0L
     ): Long {
         require(name.isNotBlank()) { "Investment name is required." }
         require(investedAmountPaise > 0L) { "Invested amount must be greater than ₹0." }
+
+        val today = IndianFinancialYear.todayEpochDay()
+        val holdingDays = (today - purchaseDateEpochDay).coerceAtLeast(1L)
+        val growthAnalysis = FinancialCalculators.analyzeInvestmentGrowth(
+            units = units,
+            purchasePricePerUnitPaise = purchasePricePerUnitPaise,
+            investedAmountPaise = investedAmountPaise,
+            currentRecordedValuePaise = currentRecordedValuePaise,
+            isCurrentValueRecorded = isCurrentValueRecorded,
+            annualGrowthOrInterestRatePercent = annualInterestRatePercent,
+            compoundingPeriodsPerYear = compoundingFrequency.periodsPerYear,
+            durationMonths = durationMonths,
+            holdingDays = holdingDays,
+            chargesPaise = chargesPaise,
+            dividendsAndInterestPaise = dividendsReceivedPaise + interestEarnedPaise,
+            isRecurringMonthly = category == InvestmentCategory.RECURRING_DEPOSIT || category == InvestmentCategory.SIP
+        )
+        val effectiveCurrentValue = growthAnalysis.effectiveCurrentValuePaise
+        val effectiveIsRecorded = isCurrentValueRecorded ||
+            currentRecordedValuePaise != null ||
+            annualInterestRatePercent != null ||
+            effectiveCurrentValue != investedAmountPaise
 
         return database.withTransaction {
             ensureSystemChartOfAccounts(isDemo)
@@ -1005,14 +1030,16 @@ class FinanceVaultRepository(
                     purchaseDateEpochDay = purchaseDateEpochDay,
                     quantity = quantity,
                     units = units,
-                    purchasePricePerUnitPaise = purchasePricePerUnitPaise,
+                    purchasePricePerUnitPaise = growthAnalysis.purchasePricePerUnitPaise,
                     investedAmountPaise = investedAmountPaise,
                     chargesPaise = chargesPaise,
-                    currentRecordedValuePaise = currentRecordedValuePaise,
-                    isCurrentValueRecorded = isCurrentValueRecorded,
+                    currentRecordedValuePaise = effectiveCurrentValue,
+                    isCurrentValueRecorded = effectiveIsRecorded,
+                    interestEarnedPaise = interestEarnedPaise,
+                    dividendsReceivedPaise = dividendsReceivedPaise,
                     linkedPaymentAccountId = paymentAccountId,
                     maturityDateEpochDay = maturityDateEpochDay,
-                    annualInterestRatePercent = annualInterestRatePercent,
+                    annualInterestRatePercent = annualInterestRatePercent ?: growthAnalysis.annualizedGrowthRatePercent.takeIf { it != 0.0 },
                     compoundingFrequency = compoundingFrequency,
                     durationMonths = durationMonths,
                     notes = notes.trim(),
@@ -1080,25 +1107,156 @@ class FinanceVaultRepository(
                 )
             }
 
+            if (effectiveIsRecorded && effectiveCurrentValue != investedAmountPaise) {
+                syncInvestmentLedgerToValuation(
+                    investmentId = invId,
+                    targetValuePaise = effectiveCurrentValue,
+                    dateEpochDay = maxOf(purchaseDateEpochDay, today),
+                    isDemo = isDemo
+                )
+            }
+
             invId
         }
     }
 
-    suspend fun updateInvestmentRecordedValue(investmentId: Long, newRecordedValuePaise: Long?) {
-        val existing = dao.getInvestmentById(investmentId) ?: return
-        dao.updateInvestment(
-            existing.copy(
-                currentRecordedValuePaise = newRecordedValuePaise,
-                isCurrentValueRecorded = newRecordedValuePaise != null
+    /**
+     * Synchronizes an investment's Balance Sheet asset ledger to its current valuation (`targetValuePaise`)
+     * by posting a double-entry mark-to-market adjustment against `EQUITY_CONTRIBUTION` (Valuation & Capital Reserve).
+     * This ensures Personal Net Worth on the Balance Sheet (`Total Assets - Total Liabilities`) always includes
+     * the full current value of all investments and wealth without affecting Cash Flow.
+     */
+    private suspend fun syncInvestmentLedgerToValuation(
+        investmentId: Long,
+        targetValuePaise: Long,
+        dateEpochDay: Long,
+        isDemo: Boolean
+    ) {
+        val invLedger = dao.getLedgerByInvestmentId(investmentId, isDemo) ?: return
+        val existingLines = dao.getJournalLines(isDemo).filter { it.ledgerAccountId == invLedger.id }
+        val currentLedgerBalance = existingLines.sumOf { it.debitPaise - it.creditPaise }
+        val delta = targetValuePaise - currentLedgerBalance
+        if (delta == 0L) return
+
+        val equityReserveLedger = getRequiredSystemLedger(LedgerClassification.EQUITY_CONTRIBUTION, isDemo)
+        val absDelta = kotlin.math.abs(delta)
+        val (srcLedger, dstLedger, narration) = if (delta > 0L) {
+            Triple(
+                equityReserveLedger,
+                invLedger,
+                "Valuation appreciation for ${invLedger.name}"
+            )
+        } else {
+            Triple(
+                invLedger,
+                equityReserveLedger,
+                "Valuation adjustment for ${invLedger.name}"
+            )
+        }
+
+        val plan = AccountingEngine.buildPostingPlan(
+            transactionType = TransactionType.CORRECTION,
+            amountPaise = absDelta,
+            description = narration,
+            sourceLedger = srcLedger,
+            destinationLedger = dstLedger
+        )
+        val voucherNo = nextVoucherNumber(dateEpochDay, isDemo)
+        val fyLabel = IndianFinancialYear.getFinancialYearLabel(dateEpochDay)
+        val entryId = dao.insertJournalEntry(
+            JournalEntryEntity(
+                transactionId = 0L,
+                voucherNumber = voucherNo,
+                dateEpochDay = dateEpochDay,
+                narration = plan.narration,
+                financialYear = fyLabel,
+                postingStatus = PostingStatus.POSTED,
+                isDemo = isDemo
             )
         )
-        if (newRecordedValuePaise != null) {
+        val lines = plan.lines.map { draft ->
+            JournalLineEntity(
+                journalEntryId = entryId,
+                transactionId = 0L,
+                voucherNumber = voucherNo,
+                dateEpochDay = dateEpochDay,
+                ledgerAccountId = draft.ledgerAccount.id,
+                ledgerAccountName = draft.ledgerAccount.name,
+                ledgerFolio = "${draft.ledgerAccount.classification.folioPrefix}-${draft.ledgerAccount.id}",
+                debitPaise = draft.debitPaise,
+                creditPaise = draft.creditPaise,
+                lineNarration = draft.narration,
+                isDemo = isDemo
+            )
+        }
+        dao.insertJournalLines(lines)
+    }
+
+    suspend fun updateInvestmentRecordedValue(
+        investmentId: Long,
+        newRecordedValuePaise: Long?,
+        updatedUnits: Double? = null,
+        updatedBuyPricePerUnitPaise: Long? = null,
+        updatedAnnualRatePercent: Double? = null,
+        updatedCompounding: CompoundingFrequency? = null,
+        updatedDurationMonths: Int? = null,
+        updatedDividendsPaise: Long? = null,
+        updatedInterestPaise: Long? = null
+    ) {
+        database.withTransaction {
+            val existing = dao.getInvestmentById(investmentId) ?: return@withTransaction
+            val units = updatedUnits ?: existing.units
+            val buyPrice = updatedBuyPricePerUnitPaise ?: existing.purchasePricePerUnitPaise
+            val rate = updatedAnnualRatePercent ?: existing.annualInterestRatePercent
+            val comp = updatedCompounding ?: existing.compoundingFrequency
+            val dur = updatedDurationMonths ?: existing.durationMonths
+            val div = updatedDividendsPaise ?: existing.dividendsReceivedPaise
+            val intr = updatedInterestPaise ?: existing.interestEarnedPaise
+
+            val today = IndianFinancialYear.todayEpochDay()
+            val holdingDays = (today - existing.purchaseDateEpochDay).coerceAtLeast(1L)
+            val analysis = FinancialCalculators.analyzeInvestmentGrowth(
+                units = units,
+                purchasePricePerUnitPaise = buyPrice,
+                investedAmountPaise = existing.investedAmountPaise,
+                currentRecordedValuePaise = newRecordedValuePaise,
+                isCurrentValueRecorded = newRecordedValuePaise != null,
+                annualGrowthOrInterestRatePercent = rate,
+                compoundingPeriodsPerYear = comp.periodsPerYear,
+                durationMonths = dur,
+                holdingDays = holdingDays,
+                chargesPaise = existing.chargesPaise,
+                dividendsAndInterestPaise = div + intr,
+                isRecurringMonthly = existing.category == InvestmentCategory.RECURRING_DEPOSIT || existing.category == InvestmentCategory.SIP
+            )
+            val targetVal = newRecordedValuePaise ?: analysis.effectiveCurrentValuePaise
+
+            dao.updateInvestment(
+                existing.copy(
+                    quantity = units,
+                    units = units,
+                    purchasePricePerUnitPaise = analysis.purchasePricePerUnitPaise,
+                    currentRecordedValuePaise = targetVal,
+                    isCurrentValueRecorded = true,
+                    annualInterestRatePercent = rate ?: analysis.annualizedGrowthRatePercent.takeIf { it != 0.0 },
+                    compoundingFrequency = comp,
+                    durationMonths = dur,
+                    dividendsReceivedPaise = div,
+                    interestEarnedPaise = intr
+                )
+            )
+            syncInvestmentLedgerToValuation(
+                investmentId = investmentId,
+                targetValuePaise = targetVal,
+                dateEpochDay = today,
+                isDemo = existing.isDemo
+            )
             dao.insertAuditLog(
                 AuditLogEntity(
                     action = "INVESTMENT_VALUATION_UPDATED",
                     entityType = "Investment",
                     entityId = investmentId,
-                    summary = "Updated valuation for '${existing.name}' to ${InrMoney.formatPaise(newRecordedValuePaise)}",
+                    summary = "Updated valuation for '${existing.name}' to ${InrMoney.formatPaise(targetVal)} (CAGR: ${analysis.annualizedGrowthRatePercent}%)",
                     isDemo = existing.isDemo
                 )
             )
@@ -1839,13 +1997,20 @@ class FinanceVaultRepository(
     }
 
     /**
-     * Ensures that if Demo Mode is active, the isolated demo dataset contains the full 12+ current-month
-     * transactions. Automatically upgrades older 6-item demo datasets without affecting real user records.
+     * Ensures that if Demo Mode is active, every dashboard and module window contains at least 10
+     * isolated demonstration records and transactions (`isDemo = true`).
      */
     private suspend fun ensureDemoDatasetUpToDate() {
-        val activeDemoUserTxs = dao.getTransactions(isDemo = true)
-            .filter { !it.isReversed && it.transactionType != TransactionType.OPENING_BALANCE }
-        if (activeDemoUserTxs.size < 12) {
+        val hasCompleteDemoSet = dao.getAccounts(isDemo = true).size >= 10 &&
+            dao.getInvestments(isDemo = true).size >= 10 &&
+            dao.getSubscriptions(isDemo = true).size >= 10 &&
+            dao.getGiftCards(isDemo = true).size >= 10 &&
+            dao.getBudgets(isDemo = true).size >= 10 &&
+            dao.getGoals(isDemo = true).size >= 10 &&
+            dao.getLoans(isDemo = true).size >= 10 &&
+            dao.getTaxRecords(isDemo = true).size >= 10 &&
+            dao.getTransactions(isDemo = true).count { !it.isReversed && it.transactionType != TransactionType.OPENING_BALANCE } >= 20
+        if (!hasCompleteDemoSet) {
             clearAllDataForMode(isDemo = true)
             seedIsolatedFictionalDemoData()
         }
@@ -1853,88 +2018,1028 @@ class FinanceVaultRepository(
 
     /**
      * Seeds strictly isolated fictional data ONLY inside `isDemo = true` when the user explicitly turns on Demo Mode.
-     * Creates 3 demo accounts and 13 current-month transactions (15 total ledger vouchers including opening balances)
-     * so every dashboard, statement, and analytics window is populated.
+     * Populates 10+ records and transactions across every single dashboard and module window:
+     * - 10 Accounts (Savings, Salary, Current, Cash, Wallet, UPI, 2 Credit Cards, Treasury Sweep, Travel Wallet)
+     * - 10 Investments (Equity Shares, ETFs, Mutual Funds, SIP, FD, RD, Gold, PPF/G-Sec, Bonds, Silver) with growth & current valuation synced to Balance Sheet
+     * - 10 Subscriptions & Renewals
+     * - 10 Gift Cards (with purchases & redemptions)
+     * - 10 Budgets (Overall + 9 category budgets)
+     * - 10 Savings Goals (with recorded contributions)
+     * - 10 Loans & Credit Facilities (with EMI schedules & repayments)
+     * - 10 Indian Tax Records (Advance Tax, TDS, Self-Assessment, GST)
+     * - 25+ Current-Month Transactions across all categories and locations
      */
     private suspend fun seedIsolatedFictionalDemoData() {
         val today = IndianFinancialYear.todayEpochDay()
+        val activeFy = IndianFinancialYear.currentFyLabel()
         val (monthStart, _) = IndianFinancialYear.currentMonthRange()
         fun demoDate(daysAgo: Long): Long = (today - daysAgo).coerceIn(monthStart, today)
 
+        // ── 1. SEED 10 DEMO ACCOUNTS ──────────────────────────────────────────────
         val bankId = createAccount(
-            name = "[DEMO - FICTIONAL] Primary Savings Bank",
+            name = "[DEMO] HDFC Primary Savings",
             accountType = AccountType.SAVINGS,
-            bankName = "Demo Fictional Bank",
-            openingBalancePaise = 1_50_000_00L,
+            bankName = "HDFC Bank",
+            branchName = "Indiranagar Branch",
+            ifscCode = "HDFC0000123",
+            openingBalancePaise = 4_50_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val salaryBankId = createAccount(
+            name = "[DEMO] ICICI Corporate Salary",
+            accountType = AccountType.SAVINGS,
+            bankName = "ICICI Bank",
+            branchName = "MG Road Branch",
+            ifscCode = "ICIC0000002",
+            openingBalancePaise = 2_80_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val currentBankId = createAccount(
+            name = "[DEMO] SBI Advisory Current A/c",
+            accountType = AccountType.CURRENT,
+            bankName = "State Bank of India",
+            branchName = "Connaught Place",
+            ifscCode = "SBIN0000691",
+            openingBalancePaise = 1_90_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val axisBankId = createAccount(
+            name = "[DEMO] Axis Burgundy Treasury",
+            accountType = AccountType.BANK,
+            bankName = "Axis Bank",
+            branchName = "Bandra Kurla Complex",
+            ifscCode = "UTIB0000240",
+            openingBalancePaise = 1_25_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val kotakUpiId = createAccount(
+            name = "[DEMO] Kotak 811 UPI Account",
+            accountType = AccountType.UPI,
+            bankName = "Kotak Mahindra Bank",
+            upiId = "demo.vault@kotak",
+            openingBalancePaise = 45_000_00L,
             isOpeningBalanceRecorded = true,
             openingDateEpochDay = demoDate(9),
             isDemo = true
         )
         val cashId = createAccount(
-            name = "[DEMO - FICTIONAL] Cash in Hand",
+            name = "[DEMO] Cash in Hand Wallet",
             accountType = AccountType.CASH,
-            openingBalancePaise = 10_000_00L,
+            openingBalancePaise = 25_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val walletId = createAccount(
+            name = "[DEMO] Amazon Pay & Fastag Wallet",
+            accountType = AccountType.DIGITAL_WALLET,
+            openingBalancePaise = 12_000_00L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val travelWalletId = createAccount(
+            name = "[DEMO] Niyo Global Travel Account",
+            accountType = AccountType.OTHER,
+            bankName = "Equitas Small Finance Bank",
+            openingBalancePaise = 35_000_00L,
             isOpeningBalanceRecorded = true,
             openingDateEpochDay = demoDate(9),
             isDemo = true
         )
         val ccId = createAccount(
-            name = "[DEMO - FICTIONAL] Platinum Credit Card",
+            name = "[DEMO] HDFC Infinia Credit Card",
             accountType = AccountType.CREDIT_CARD,
-            creditLimitPaise = 1_00_000_00L,
+            bankName = "HDFC Bank",
+            creditLimitPaise = 8_00_000_00L,
+            openingBalancePaise = 0L,
+            isOpeningBalanceRecorded = true,
+            openingDateEpochDay = demoDate(9),
+            isDemo = true
+        )
+        val amexCcId = createAccount(
+            name = "[DEMO] Amex Platinum Travel Card",
+            accountType = AccountType.CREDIT_CARD,
+            bankName = "American Express",
+            creditLimitPaise = 5_00_000_00L,
             openingBalancePaise = 0L,
             isOpeningBalanceRecorded = true,
             openingDateEpochDay = demoDate(9),
             isDemo = true
         )
 
-        // 1. Salary received: ₹85,000 into bank
+        // ── 2. SEED 10 DEMO INVESTMENTS (WITH SHARE PRICE, GROWTH RATE & CURRENT VALUATION) ──
+        addInvestment(
+            name = "[DEMO] Reliance Industries Ltd (NSE: RELIANCE)",
+            category = InvestmentCategory.EQUITY_SHARES,
+            purchaseDateEpochDay = today - 420L,
+            quantity = 50.0,
+            units = 50.0,
+            purchasePricePerUnitPaise = 2_400_00L,
+            investedAmountPaise = 1_20_000_00L,
+            currentRecordedValuePaise = 1_48_500_00L, // Current share price ₹2,970
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 20.3,
+            dividendsReceivedPaise = 1_500_00L,
+            paymentAccountId = null, // Opening holding
+            notes = "50 Equity Shares • Buy ₹2,400 • Current ₹2,970",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Tata Consultancy Services (NSE: TCS)",
+            category = InvestmentCategory.EQUITY_SHARES,
+            purchaseDateEpochDay = today - 380L,
+            quantity = 25.0,
+            units = 25.0,
+            purchasePricePerUnitPaise = 3_400_00L,
+            investedAmountPaise = 85_000_00L,
+            currentRecordedValuePaise = 1_02_500_00L, // Current share price ₹4,100
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 19.8,
+            dividendsReceivedPaise = 2_800_00L,
+            paymentAccountId = null,
+            notes = "25 Equity Shares • Buy ₹3,400 • Current ₹4,100",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Infosys Ltd (NSE: INFY)",
+            category = InvestmentCategory.EQUITY_SHARES,
+            purchaseDateEpochDay = today - 310L,
+            quantity = 40.0,
+            units = 40.0,
+            purchasePricePerUnitPaise = 1_450_00L,
+            investedAmountPaise = 58_000_00L,
+            currentRecordedValuePaise = 74_000_00L, // Current share price ₹1,850
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 33.2,
+            dividendsReceivedPaise = 1_600_00L,
+            paymentAccountId = null,
+            notes = "40 Equity Shares • Buy ₹1,450 • Current ₹1,850",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Nippon India Nifty 50 BeES ETF",
+            category = InvestmentCategory.ETF,
+            purchaseDateEpochDay = today - 290L,
+            quantity = 300.0,
+            units = 300.0,
+            purchasePricePerUnitPaise = 220_00L,
+            investedAmountPaise = 66_000_00L,
+            currentRecordedValuePaise = 81_000_00L, // Current NAV ₹270
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 29.4,
+            paymentAccountId = null,
+            notes = "300 ETF Units • Buy ₹220 • Current ₹270",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Parag Parikh Flexi Cap Direct Growth",
+            category = InvestmentCategory.MUTUAL_FUND,
+            purchaseDateEpochDay = today - 500L,
+            quantity = 1200.0,
+            units = 1200.0,
+            purchasePricePerUnitPaise = 65_00L,
+            investedAmountPaise = 78_000_00L,
+            currentRecordedValuePaise = 1_03_200_00L, // Current NAV ₹86
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 22.6,
+            paymentAccountId = null,
+            notes = "1,200 MF Units • Buy NAV ₹65 • Current NAV ₹86",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Motilal Oswal Midcap 150 SIP",
+            category = InvestmentCategory.SIP,
+            purchaseDateEpochDay = demoDate(2),
+            quantity = 100.0,
+            units = 100.0,
+            purchasePricePerUnitPaise = 150_00L,
+            investedAmountPaise = 15_000_00L,
+            currentRecordedValuePaise = 16_200_00L,
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 24.0,
+            compoundingFrequency = CompoundingFrequency.MONTHLY,
+            durationMonths = 36,
+            paymentAccountId = bankId,
+            notes = "Monthly Equity SIP • 24% target CAGR",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] HDFC Bank 2-Year Fixed Deposit",
+            category = InvestmentCategory.FIXED_DEPOSIT,
+            purchaseDateEpochDay = today - 180L,
+            quantity = 1.0,
+            units = 1.0,
+            purchasePricePerUnitPaise = 1_00_000_00L,
+            investedAmountPaise = 1_00_000_00L,
+            currentRecordedValuePaise = 1_03_700_00L,
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 7.4,
+            compoundingFrequency = CompoundingFrequency.QUARTERLY,
+            durationMonths = 24,
+            interestEarnedPaise = 3_700_00L,
+            paymentAccountId = null,
+            notes = "7.40% p.a. Quarterly Compounding FD",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] SBI Wealth Recurring Deposit",
+            category = InvestmentCategory.RECURRING_DEPOSIT,
+            purchaseDateEpochDay = demoDate(4),
+            quantity = 1.0,
+            units = 1.0,
+            purchasePricePerUnitPaise = 10_000_00L,
+            investedAmountPaise = 10_000_00L,
+            currentRecordedValuePaise = 10_350_00L,
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 7.1,
+            compoundingFrequency = CompoundingFrequency.QUARTERLY,
+            durationMonths = 12,
+            paymentAccountId = currentBankId,
+            notes = "7.10% p.a. 12-Month Recurring Deposit",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] RBI Sovereign Gold Bond (SGB 24K)",
+            category = InvestmentCategory.GOLD,
+            purchaseDateEpochDay = today - 400L,
+            quantity = 10.0,
+            units = 10.0,
+            purchasePricePerUnitPaise = 6_200_00L,
+            investedAmountPaise = 62_000_00L,
+            currentRecordedValuePaise = 78_500_00L, // ₹7,850 / gram
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 23.8,
+            interestEarnedPaise = 1_550_00L,
+            paymentAccountId = null,
+            notes = "10 Grams 24K SGB • 2.5% p.a. extra coupon",
+            isDemo = true
+        )
+        addInvestment(
+            name = "[DEMO] Public Provident Fund (PPF) & GOI Bonds",
+            category = InvestmentCategory.GOVT_SECURITIES,
+            purchaseDateEpochDay = today - 600L,
+            quantity = 1.0,
+            units = 1.0,
+            purchasePricePerUnitPaise = 1_50_000_00L,
+            investedAmountPaise = 1_50_000_00L,
+            currentRecordedValuePaise = 1_68_000_00L,
+            isCurrentValueRecorded = true,
+            annualInterestRatePercent = 7.1,
+            compoundingFrequency = CompoundingFrequency.ANNUALLY,
+            durationMonths = 180,
+            interestEarnedPaise = 18_000_00L,
+            paymentAccountId = null,
+            notes = "Tax-Free EEE PPF Sovereign Account (7.1% p.a.)",
+            isDemo = true
+        )
+
+        // ── 3. SEED 10 DEMO GIFT CARDS (WITH PURCHASES & USAGE) ──────────────────
+        val gcAmazonId = addGiftCard(
+            brand = "Amazon Pay",
+            name = "[DEMO] Amazon Shopping Voucher",
+            initialValuePaise = 5_000_00L,
+            remainingValuePaise = 5_000_00L,
+            purchaseDateEpochDay = demoDate(8),
+            cardNumberRaw = "6001200230034004",
+            redemptionPinRaw = "8821",
+            purchasedFromAccountId = bankId,
+            notes = "Amazon Prime Festival Gift Card",
+            isDemo = true
+        )
+        // Record usage on Amazon Gift Card so Gift Card Usage transaction is demonstrated
+        recordTransaction(
+            transactionType = TransactionType.GIFT_CARD_USAGE,
+            dateEpochDay = demoDate(5),
+            amountPaise = 1_200_00L,
+            linkedGiftCardId = gcAmazonId,
+            category = "Shopping & Lifestyle",
+            description = "[DEMO] Smart Home Accessories via Amazon Gift Card",
+            locationName = "Amazon India Online",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Flipkart",
+            name = "[DEMO] Flipkart SuperCoin EGV",
+            initialValuePaise = 3_000_00L,
+            remainingValuePaise = 2_250_00L,
+            purchaseDateEpochDay = demoDate(8),
+            cardNumberRaw = "7001800290031122",
+            redemptionPinRaw = "4410",
+            purchasedFromAccountId = null,
+            notes = "Electronics & Apparel Voucher",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Swiggy Money",
+            name = "[DEMO] Swiggy Instamart & Dining Voucher",
+            initialValuePaise = 2_000_00L,
+            remainingValuePaise = 1_450_00L,
+            purchaseDateEpochDay = demoDate(7),
+            cardNumberRaw = "5112622373348445",
+            redemptionPinRaw = "1920",
+            purchasedFromAccountId = null,
+            notes = "Food & Instant Grocery Balance",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Zomato",
+            name = "[DEMO] Zomato Gold Dining Gift Card",
+            initialValuePaise = 2_500_00L,
+            remainingValuePaise = 1_800_00L,
+            purchaseDateEpochDay = demoDate(7),
+            cardNumberRaw = "4111522263337444",
+            redemptionPinRaw = "3309",
+            purchasedFromAccountId = null,
+            notes = "Restaurant Dining Credits",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Myntra",
+            name = "[DEMO] Myntra Insider Fashion Card",
+            initialValuePaise = 4_000_00L,
+            remainingValuePaise = 3_100_00L,
+            purchaseDateEpochDay = demoDate(6),
+            cardNumberRaw = "8111922203331444",
+            redemptionPinRaw = "7741",
+            purchasedFromAccountId = null,
+            notes = "Festive Wardrobe Voucher",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Nykaa",
+            name = "[DEMO] Nykaa Prive Grooming Card",
+            initialValuePaise = 1_500_00L,
+            remainingValuePaise = 1_500_00L,
+            purchaseDateEpochDay = demoDate(6),
+            cardNumberRaw = "9111022213332444",
+            redemptionPinRaw = "5582",
+            purchasedFromAccountId = null,
+            notes = "Personal Care Gift Card",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "BookMyShow",
+            name = "[DEMO] BookMyShow WinPin Voucher",
+            initialValuePaise = 1_000_00L,
+            remainingValuePaise = 600_00L,
+            purchaseDateEpochDay = demoDate(5),
+            cardNumberRaw = "3111422253336444",
+            redemptionPinRaw = "6612",
+            purchasedFromAccountId = null,
+            notes = "Movies & Live Events",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Croma",
+            name = "[DEMO] Tata Croma Electronics Card",
+            initialValuePaise = 10_000_00L,
+            remainingValuePaise = 7_500_00L,
+            purchaseDateEpochDay = demoDate(5),
+            cardNumberRaw = "2111322243335444",
+            redemptionPinRaw = "9901",
+            purchasedFromAccountId = null,
+            notes = "Gadget Upgrade Gift Card",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Decathlon",
+            name = "[DEMO] Decathlon Sports & Fitness Card",
+            initialValuePaise = 3_000_00L,
+            remainingValuePaise = 2_400_00L,
+            purchaseDateEpochDay = demoDate(4),
+            cardNumberRaw = "1111222233334444",
+            redemptionPinRaw = "2048",
+            purchasedFromAccountId = null,
+            notes = "Running & Trekking Gear",
+            isDemo = true
+        )
+        addGiftCard(
+            brand = "Starbucks India",
+            name = "[DEMO] Tata Starbucks Stars Card",
+            initialValuePaise = 2_000_00L,
+            remainingValuePaise = 1_350_00L,
+            purchaseDateEpochDay = demoDate(3),
+            cardNumberRaw = "6555766687779888",
+            redemptionPinRaw = "7123",
+            purchasedFromAccountId = null,
+            notes = "Coffee & Work Lounge Card",
+            isDemo = true
+        )
+
+        // ── 4. SEED 10 DEMO SUBSCRIPTIONS & RENEWALS ─────────────────────────────
+        addSubscription(
+            name = "[DEMO] Netflix 4K Ultra HD Plan",
+            costPaise = 649_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 5L,
+            paymentAccountId = ccId,
+            startDateEpochDay = demoDate(9),
+            notes = "Family 4-Screen UHD Plan",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] Spotify Premium Duo",
+            costPaise = 149_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 8L,
+            paymentAccountId = kotakUpiId,
+            startDateEpochDay = demoDate(9),
+            notes = "Ad-free Music & Podcasts",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] Amazon Prime Annual Membership",
+            costPaise = 1_499_00L,
+            billingFrequency = BillingFrequency.ANNUALLY,
+            nextRenewalEpochDay = today + 90L,
+            paymentAccountId = ccId,
+            startDateEpochDay = demoDate(9),
+            notes = "Prime Delivery, Video & Music",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] YouTube Premium Family",
+            costPaise = 299_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 11L,
+            paymentAccountId = kotakUpiId,
+            startDateEpochDay = demoDate(9),
+            notes = "YouTube Ad-Free + Music",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] JioFiber 300 Mbps Postpaid",
+            costPaise = 1_178_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 3L,
+            paymentAccountId = bankId,
+            startDateEpochDay = demoDate(9),
+            notes = "Home Symmetrical Fiber Broadband",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] Apple One / iCloud+ 200GB",
+            costPaise = 365_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 14L,
+            paymentAccountId = amexCcId,
+            startDateEpochDay = demoDate(9),
+            notes = "Cloud Backup & Apple Services",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] Microsoft 365 Family Cloud",
+            costPaise = 6_199_00L,
+            billingFrequency = BillingFrequency.ANNUALLY,
+            nextRenewalEpochDay = today + 145L,
+            paymentAccountId = ccId,
+            startDateEpochDay = demoDate(9),
+            notes = "1TB OneDrive + Office Suite",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] Cult.fit Elite Pro Pass",
+            costPaise = 4_500_00L,
+            billingFrequency = BillingFrequency.QUARTERLY,
+            nextRenewalEpochDay = today + 35L,
+            paymentAccountId = amexCcId,
+            startDateEpochDay = demoDate(9),
+            notes = "Gym & Group Fitness Membership",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] The Hindu & BusinessLine Digital",
+            costPaise = 699_00L,
+            billingFrequency = BillingFrequency.QUARTERLY,
+            nextRenewalEpochDay = today + 22L,
+            paymentAccountId = kotakUpiId,
+            startDateEpochDay = demoDate(9),
+            notes = "Financial & National e-Paper",
+            isDemo = true
+        )
+        addSubscription(
+            name = "[DEMO] ChatGPT Plus / Cloud Developer Tools",
+            costPaise = 1_999_00L,
+            billingFrequency = BillingFrequency.MONTHLY,
+            nextRenewalEpochDay = today + 18L,
+            paymentAccountId = amexCcId,
+            startDateEpochDay = demoDate(9),
+            notes = "Work & Productivity Suite",
+            isDemo = true
+        )
+
+        // ── 5. SEED 10 DEMO BUDGETS (OVERALL + 9 CATEGORY BUDGETS) ───────────────
+        addBudget(
+            name = "Overall Monthly Budget",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "OVERALL",
+            limitPaise = 65_000_00L,
+            financialYear = activeFy,
+            notes = "Total monthly household & lifestyle cap",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Housing & Rent Cap",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Housing & Rent",
+            limitPaise = 25_000_00L,
+            financialYear = activeFy,
+            notes = "Rent, Society Maintenance & Property Care",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Household & Groceries Budget",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Household & Groceries",
+            limitPaise = 8_000_00L,
+            financialYear = activeFy,
+            notes = "Supermarket, Dairy & Fresh Produce",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Food & Dining Out Limit",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Food & Dining",
+            limitPaise = 5_000_00L,
+            financialYear = activeFy,
+            notes = "Restaurants, Cafes & Weekend Ordering",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Utilities & Broadband Budget",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Utilities & Bills",
+            limitPaise = 4_500_00L,
+            financialYear = activeFy,
+            notes = "Electricity, Fiber Internet, Mobile & Gas",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Transportation & Fuel Limit",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Transportation & Fuel",
+            limitPaise = 5_000_00L,
+            financialYear = activeFy,
+            notes = "Petrol, Metro Pass & Airport Cabs",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Healthcare & Wellness Reserve",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Healthcare & Medical",
+            limitPaise = 3_500_00L,
+            financialYear = activeFy,
+            notes = "Pharmacy, Lab Tests & Preventive Care",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Upskilling & Education Budget",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Education",
+            limitPaise = 5_000_00L,
+            financialYear = activeFy,
+            notes = "Courses, Books & Certifications",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Shopping & Lifestyle Cap",
+            budgetPeriod = BudgetPeriod.MONTHLY,
+            category = "Shopping & Lifestyle",
+            limitPaise = 6_000_00L,
+            financialYear = activeFy,
+            notes = "Apparel, Home Decor & Electronics",
+            isDemo = true
+        )
+        addBudget(
+            name = "[DEMO] Annual Travel & Holiday Budget",
+            budgetPeriod = BudgetPeriod.ANNUAL,
+            category = "Entertainment & Subscriptions",
+            limitPaise = 1_20_000_00L,
+            financialYear = activeFy,
+            notes = "Annual Family Vacation & Subscriptions",
+            isDemo = true
+        )
+
+        // ── 6. SEED 10 DEMO SAVINGS GOALS ────────────────────────────────────────
+        addGoal(
+            name = "[DEMO] 6-Month Emergency Liquid Cushion",
+            goalType = GoalType.EMERGENCY_FUND,
+            targetAmountPaise = 5_00_000_00L,
+            currentSavedPaise = 3_85_000_00L,
+            targetDateEpochDay = today + 180L,
+            linkedAccountId = bankId,
+            notes = "Liquid savings + sweep FD emergency reserve",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Europe & Swiss Alps Family Holiday",
+            goalType = GoalType.SAVINGS,
+            targetAmountPaise = 3_50_000_00L,
+            currentSavedPaise = 2_10_000_00L,
+            targetDateEpochDay = today + 240L,
+            linkedAccountId = travelWalletId,
+            notes = "Flights, Eurail pass & stays",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Home Down Payment Corpus",
+            goalType = GoalType.PURCHASE,
+            targetAmountPaise = 20_00_000_00L,
+            currentSavedPaise = 11_50_000_00L,
+            targetDateEpochDay = today + 540L,
+            linkedAccountId = bankId,
+            notes = "20% down payment for 3BHK apartment",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] MacBook Pro M4 Workstation Upgrade",
+            goalType = GoalType.PURCHASE,
+            targetAmountPaise = 2_20_000_00L,
+            currentSavedPaise = 1_75_000_00L,
+            targetDateEpochDay = today + 60L,
+            linkedAccountId = salaryBankId,
+            notes = "Workstation & studio display",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Financial Independence Retire Early (FIRE)",
+            goalType = GoalType.SAVINGS,
+            targetAmountPaise = 1_00_00_000_00L,
+            currentSavedPaise = 24_50_000_00L,
+            targetDateEpochDay = today + 3650L,
+            linkedAccountId = bankId,
+            notes = "Long-term equity & index portfolio",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Higher Education & MBA Corpus",
+            goalType = GoalType.SAVINGS,
+            targetAmountPaise = 15_00_000_00L,
+            currentSavedPaise = 6_40_000_00L,
+            targetDateEpochDay = today + 900L,
+            linkedAccountId = axisBankId,
+            notes = "Executive education & tuition fund",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] EV SUV Upgrade Fund",
+            goalType = GoalType.PURCHASE,
+            targetAmountPaise = 12_00_000_00L,
+            currentSavedPaise = 4_80_000_00L,
+            targetDateEpochDay = today + 450L,
+            linkedAccountId = salaryBankId,
+            notes = "Zero-debt electric vehicle purchase",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Parents Medical & Health Buffer",
+            goalType = GoalType.EMERGENCY_FUND,
+            targetAmountPaise = 4_00_000_00L,
+            currentSavedPaise = 3_20_000_00L,
+            targetDateEpochDay = today + 120L,
+            linkedAccountId = bankId,
+            notes = "Dedicated healthcare & deductible fund",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] 5kW Rooftop Solar & Home Automation",
+            goalType = GoalType.PURCHASE,
+            targetAmountPaise = 2_50_000_00L,
+            currentSavedPaise = 1_60_000_00L,
+            targetDateEpochDay = today + 150L,
+            linkedAccountId = currentBankId,
+            notes = "Clean energy & smart home setup",
+            isDemo = true
+        )
+        addGoal(
+            name = "[DEMO] Annual Term & Health Insurance Pool",
+            goalType = GoalType.SAVINGS,
+            targetAmountPaise = 90_000_00L,
+            currentSavedPaise = 75_000_00L,
+            targetDateEpochDay = today + 45L,
+            linkedAccountId = bankId,
+            notes = "Annual renewal sinking fund",
+            isDemo = true
+        )
+
+        // ── 7. SEED 10 DEMO LOANS & CREDIT FACILITIES (WITH EMI REPAYMENTS) ──────
+        val homeLoanId = addLoan(
+            name = "[DEMO] SBI MaxGain Home Loan",
+            loanType = LoanType.HOME,
+            lenderName = "State Bank of India",
+            principalPaise = 4_50_000_00L,
+            annualInterestRatePercent = 8.50,
+            tenureMonths = 120,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Floating rate home loan • 8.50% p.a.",
+            isDemo = true
+        )
+        // Record an EMI payment on the Home Loan in the current month
+        recordTransaction(
+            transactionType = TransactionType.LOAN_REPAYMENT,
+            dateEpochDay = demoDate(5),
+            amountPaise = 5_580_00L,
+            principalComponentPaise = 2_392_00L,
+            interestComponentPaise = 3_188_00L,
+            sourceAccountId = bankId,
+            category = "Loan EMI Repayment",
+            description = "[DEMO] Monthly EMI for SBI MaxGain Home Loan",
+            linkedLoanId = homeLoanId,
+            isDemo = true
+        )
+        val carLoanId = addLoan(
+            name = "[DEMO] HDFC Green EV Car Loan",
+            loanType = LoanType.VEHICLE,
+            lenderName = "HDFC Bank",
+            principalPaise = 1_80_000_00L,
+            annualInterestRatePercent = 8.90,
+            tenureMonths = 48,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "EV 4-Wheeler Auto Loan",
+            isDemo = true
+        )
+        recordTransaction(
+            transactionType = TransactionType.LOAN_REPAYMENT,
+            dateEpochDay = demoDate(4),
+            amountPaise = 4_470_00L,
+            principalComponentPaise = 3_135_00L,
+            interestComponentPaise = 1_335_00L,
+            sourceAccountId = salaryBankId,
+            category = "Loan EMI Repayment",
+            description = "[DEMO] Monthly EMI for HDFC EV Car Loan",
+            linkedLoanId = carLoanId,
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] ICICI Executive Education Loan",
+            loanType = LoanType.EDUCATION,
+            lenderName = "ICICI Bank",
+            principalPaise = 1_20_000_00L,
+            annualInterestRatePercent = 9.25,
+            tenureMonths = 36,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Section 80E Tax-Deductible Education Loan",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] Axis Quick Personal Credit Line",
+            loanType = LoanType.PERSONAL,
+            lenderName = "Axis Bank",
+            principalPaise = 60_000_00L,
+            annualInterestRatePercent = 10.75,
+            tenureMonths = 24,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Home office renovation credit line",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] Bajaj Finserv Zero-Cost Appliance EMI",
+            loanType = LoanType.OTHER,
+            lenderName = "Bajaj Finance",
+            principalPaise = 36_000_00L,
+            annualInterestRatePercent = 0.0,
+            tenureMonths = 12,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "0% Interest Smart Refrigerator & Washer EMI",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] Kotak Two-Wheeler Commuter Loan",
+            loanType = LoanType.VEHICLE,
+            lenderName = "Kotak Mahindra Prime",
+            principalPaise = 45_000_00L,
+            annualInterestRatePercent = 9.50,
+            tenureMonths = 24,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Ather Electric Scooter Loan",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] Muthoot Sovereign Gold Overdraft",
+            loanType = LoanType.OTHER,
+            lenderName = "Muthoot Finance",
+            principalPaise = 50_000_00L,
+            annualInterestRatePercent = 9.00,
+            tenureMonths = 12,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Short-term working capital gold line",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] Tata Capital Solar Rooftop Loan",
+            loanType = LoanType.HOME,
+            lenderName = "Tata Capital",
+            principalPaise = 75_000_00L,
+            annualInterestRatePercent = 8.75,
+            tenureMonths = 36,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Green energy home improvement loan",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] HDFC SmartEMI Studio Equipment",
+            loanType = LoanType.PERSONAL,
+            lenderName = "HDFC Bank",
+            principalPaise = 30_000_00L,
+            annualInterestRatePercent = 10.50,
+            tenureMonths = 12,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Camera & lighting gear EMI",
+            isDemo = true
+        )
+        addLoan(
+            name = "[DEMO] IDFC First Skill Certification Loan",
+            loanType = LoanType.EDUCATION,
+            lenderName = "IDFC First Bank",
+            principalPaise = 40_000_00L,
+            annualInterestRatePercent = 9.00,
+            tenureMonths = 18,
+            startDateEpochDay = demoDate(9),
+            disbursedToAccountId = null,
+            notes = "Executive AI & Quantitative Finance Program",
+            isDemo = true
+        )
+
+        // ── 8. SEED 10 DEMO INDIAN TAX RECORDS ───────────────────────────────────
+        addTaxRecord(
+            taxType = TaxType.ADVANCE_TAX,
+            financialYear = activeFy,
+            amountPaidPaise = 15_000_00L,
+            paymentDateEpochDay = demoDate(6),
+            dueDateEpochDay = today + 30L,
+            challanNumber = "ITNS280-DEMO-Q1",
+            paymentAccountId = bankId,
+            supportingDocLabel = "Advance Tax Q1 Installment (15%)",
+            notes = "[DEMO] Paid via Income Tax e-Pay Portal",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.ADVANCE_TAX,
+            financialYear = activeFy,
+            amountPaidPaise = 25_000_00L,
+            paymentDateEpochDay = demoDate(5),
+            dueDateEpochDay = today + 60L,
+            challanNumber = "ITNS280-DEMO-Q2",
+            paymentAccountId = null,
+            supportingDocLabel = "Advance Tax Q2 Installment (45%)",
+            notes = "[DEMO] Second installment challan receipt",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.TDS,
+            financialYear = activeFy,
+            amountPaidPaise = 12_500_00L,
+            paymentDateEpochDay = demoDate(8),
+            challanNumber = "FORM16-TDS-SAL01",
+            paymentAccountId = null,
+            supportingDocLabel = "Salary TDS u/s 192 (Form 16 Part A)",
+            notes = "[DEMO] Employer monthly salary tax deduction",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.TDS,
+            financialYear = activeFy,
+            amountPaidPaise = 1_850_00L,
+            paymentDateEpochDay = demoDate(6),
+            challanNumber = "FORM26AS-194J-02",
+            paymentAccountId = null,
+            supportingDocLabel = "Professional Consulting TDS u/s 194J (10%)",
+            notes = "[DEMO] Deducted on advisory retainer invoice",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.TDS,
+            financialYear = activeFy,
+            amountPaidPaise = 740_00L,
+            paymentDateEpochDay = demoDate(4),
+            challanNumber = "FORM16A-194A-FD",
+            paymentAccountId = null,
+            supportingDocLabel = "Bank FD Interest TDS u/s 194A",
+            notes = "[DEMO] Reflected in Annual Information Statement (AIS)",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.INCOME_TAX,
+            financialYear = activeFy,
+            amountPaidPaise = 8_400_00L,
+            paymentDateEpochDay = demoDate(3),
+            challanNumber = "ITNS280-LTCG-112A",
+            paymentAccountId = null,
+            supportingDocLabel = "Equity LTCG Tax Provision u/s 112A",
+            notes = "[DEMO] Long-term capital gains tax computation",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.SELF_ASSESSMENT_TAX,
+            financialYear = activeFy,
+            amountPaidPaise = 6_200_00L,
+            paymentDateEpochDay = demoDate(2),
+            challanNumber = "ITNS280-SAT-300",
+            paymentAccountId = null,
+            supportingDocLabel = "Self-Assessment Tax u/s 140A (Minor Head 300)",
+            notes = "[DEMO] Balance tax before ITR verification",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.GST,
+            financialYear = activeFy,
+            amountPaidPaise = 3_330_00L,
+            paymentDateEpochDay = demoDate(2),
+            challanNumber = "PMT06-GST-DEMO1",
+            paymentAccountId = currentBankId,
+            supportingDocLabel = "GST Challan on Advisory Services (18%)",
+            notes = "[DEMO] GSTR-3B monthly output tax settlement",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.OTHER,
+            financialYear = activeFy,
+            amountPaidPaise = 420_00L,
+            paymentDateEpochDay = demoDate(1),
+            challanNumber = "STT-NSE-CONTRACT",
+            paymentAccountId = null,
+            supportingDocLabel = "Securities Transaction Tax (STT) & Stamp Duty",
+            notes = "[DEMO] Equity delivery brokerage statement",
+            isDemo = true
+        )
+        addTaxRecord(
+            taxType = TaxType.OTHER,
+            financialYear = activeFy,
+            amountPaidPaise = 2_400_00L,
+            paymentDateEpochDay = demoDate(1),
+            challanNumber = "BBMP-PTAX-2026",
+            paymentAccountId = null,
+            supportingDocLabel = "Municipal Property Tax & Cess Receipt",
+            notes = "[DEMO] Annual residential property tax",
+            isDemo = true
+        )
+
+        // ── 9. SEED 14+ CURRENT-MONTH INCOME, EXPENSE, TRANSFER & CARD TRANSACTIONS ──
+        // 1. Salary received: ₹1,15,000 into salary bank
         recordTransaction(
             transactionType = TransactionType.INCOME,
             dateEpochDay = demoDate(9),
-            amountPaise = 85_000_00L,
-            destinationAccountId = bankId,
+            amountPaise = 1_15_000_00L,
+            destinationAccountId = salaryBankId,
             category = "Salary Income",
-            description = "[DEMO - FICTIONAL] Monthly Salary Credited",
+            description = "[DEMO] Monthly Corporate Salary Credited",
             locationName = "Outer Ring Road, Bengaluru",
             latitude = 12.9304,
             longitude = 77.6784,
             isDemo = true
         )
-        // 2. Housing & Rent expense: ₹22,000 from bank
+        // 2. Housing & Rent expense: ₹22,000 from primary bank
         recordTransaction(
             transactionType = TransactionType.EXPENSE,
             dateEpochDay = demoDate(8),
             amountPaise = 22_000_00L,
             sourceAccountId = bankId,
             category = "Housing & Rent",
-            description = "[DEMO - FICTIONAL] Apartment Rent & Maintenance",
+            description = "[DEMO] Apartment Rent & Society Maintenance",
             locationName = "Indiranagar, Bengaluru",
             latitude = 12.9784,
             longitude = 77.6408,
             isDemo = true
         )
-        // 3. Household & Groceries expense: ₹4,800 from bank
+        // 3. Household & Groceries expense: ₹4,800 from primary bank
         recordTransaction(
             transactionType = TransactionType.EXPENSE,
             dateEpochDay = demoDate(7),
             amountPaise = 4_800_00L,
             sourceAccountId = bankId,
             category = "Household & Groceries",
-            description = "[DEMO - FICTIONAL] Monthly Groceries & Supplies",
+            description = "[DEMO] Monthly Organic Groceries & Supplies",
             locationName = "Connaught Place, New Delhi",
             latitude = 28.6315,
             longitude = 77.2167,
             isDemo = true
         )
-        // 4. Business & Freelance income: ₹18,500 into bank
+        // 4. Business & Freelance income: ₹28,500 into current bank
         recordTransaction(
             transactionType = TransactionType.INCOME,
             dateEpochDay = demoDate(6),
-            amountPaise = 18_500_00L,
-            destinationAccountId = bankId,
+            amountPaise = 28_500_00L,
+            destinationAccountId = currentBankId,
             category = "Business & Freelance",
-            description = "[DEMO - FICTIONAL] Advisory & Consulting Retainer",
+            description = "[DEMO] FinTech Architecture Advisory Retainer",
             locationName = "Cyber Hub, Gurugram",
             latitude = 28.4950,
             longitude = 77.0895,
@@ -1948,7 +3053,7 @@ class FinanceVaultRepository(
             sourceAccountId = bankId,
             destinationAccountId = cashId,
             category = "Account Transfer",
-            description = "[DEMO - FICTIONAL] ATM Cash Withdrawal to Wallet",
+            description = "[DEMO] ATM Cash Withdrawal to Wallet",
             locationName = "Indiranagar, Bengaluru",
             latitude = 12.9784,
             longitude = 77.6408,
@@ -1961,20 +3066,20 @@ class FinanceVaultRepository(
             amountPaise = 2_450_00L,
             sourceAccountId = ccId,
             category = "Utilities & Bills",
-            description = "[DEMO - FICTIONAL] Broadband & Electricity Bill via Card",
+            description = "[DEMO] Fiber Broadband & BESCOM Electricity Bill",
             locationName = "Bandra West, Mumbai",
             latitude = 19.0596,
             longitude = 72.8295,
             isDemo = true
         )
-        // 7. Transportation & Fuel expense: ₹3,200 from bank
+        // 7. Transportation & Fuel expense: ₹3,200 from UPI account
         recordTransaction(
             transactionType = TransactionType.EXPENSE,
             dateEpochDay = demoDate(4),
             amountPaise = 3_200_00L,
-            sourceAccountId = bankId,
+            sourceAccountId = kotakUpiId,
             category = "Transportation & Fuel",
-            description = "[DEMO - FICTIONAL] Highway Fuel & Metro Pass Recharge",
+            description = "[DEMO] Shell Highway Fuel & Namma Metro Pass",
             locationName = "Hitech City, Hyderabad",
             latitude = 17.4435,
             longitude = 78.3772,
@@ -1987,7 +3092,7 @@ class FinanceVaultRepository(
             amountPaise = 1_850_00L,
             sourceAccountId = ccId,
             category = "Food & Dining",
-            description = "[DEMO - FICTIONAL] Family Dinner & Specialty Coffee",
+            description = "[DEMO] Family Dinner & Third Wave Specialty Coffee",
             locationName = "Koramangala, Bengaluru",
             latitude = 12.9352,
             longitude = 77.6245,
@@ -2000,59 +3105,83 @@ class FinanceVaultRepository(
             amountPaise = 1_400_00L,
             sourceAccountId = cashId,
             category = "Healthcare & Medical",
-            description = "[DEMO - FICTIONAL] Pharmacy & Annual Health Checkup",
+            description = "[DEMO] Apollo Pharmacy & Preventive Health Check",
             locationName = "Adyar, Chennai",
             latitude = 13.0012,
             longitude = 80.2565,
             isDemo = true
         )
-        // 10. Interest received: ₹1,250 into bank
+        // 10. Interest received: ₹3,250 into savings bank
         recordTransaction(
             transactionType = TransactionType.INTEREST_RECEIVED,
             dateEpochDay = demoDate(2),
-            amountPaise = 1_250_00L,
+            amountPaise = 3_250_00L,
             destinationAccountId = bankId,
             category = "Interest Income",
-            description = "[DEMO - FICTIONAL] Quarterly Savings Bank Interest",
+            description = "[DEMO] Quarterly Savings & Sweep FD Interest",
             isDemo = true
         )
-        // 11. Education expense: ₹3,500 from bank
+        // 11. Dividend received: ₹4,400 into salary bank
+        recordTransaction(
+            transactionType = TransactionType.DIVIDEND_RECEIVED,
+            dateEpochDay = demoDate(2),
+            amountPaise = 4_400_00L,
+            destinationAccountId = salaryBankId,
+            category = "Dividend Income",
+            description = "[DEMO] Interim Equity Dividend (TCS & Infosys)",
+            isDemo = true
+        )
+        // 12. Education expense: ₹3,500 from primary bank
         recordTransaction(
             transactionType = TransactionType.EXPENSE,
             dateEpochDay = demoDate(2),
             amountPaise = 3_500_00L,
             sourceAccountId = bankId,
             category = "Education",
-            description = "[DEMO - FICTIONAL] Financial Modeling Certification",
+            description = "[DEMO] Quantitative Finance & AI Certification",
             locationName = "Koregaon Park, Pune",
             latitude = 18.5362,
             longitude = 73.8940,
             isDemo = true
         )
-        // 12. Credit card repayment: ₹2,000 from bank
+        // 13. Shopping & Lifestyle expense: ₹2,800 via Amex Credit Card
+        recordTransaction(
+            transactionType = TransactionType.CREDIT_CARD_PURCHASE,
+            dateEpochDay = demoDate(1),
+            amountPaise = 2_800_00L,
+            sourceAccountId = amexCcId,
+            category = "Shopping & Lifestyle",
+            description = "[DEMO] Running Shoes & Ergonomic Desk Stand",
+            locationName = "Jubilee Hills, Hyderabad",
+            latitude = 17.4326,
+            longitude = 78.4071,
+            isDemo = true
+        )
+        // 14. Credit card repayment: ₹3,000 from bank to HDFC Infinia Card
         recordTransaction(
             transactionType = TransactionType.CREDIT_CARD_REPAYMENT,
             dateEpochDay = demoDate(1),
-            amountPaise = 2_000_00L,
+            amountPaise = 3_000_00L,
             sourceAccountId = bankId,
             destinationAccountId = ccId,
             category = "Credit Card Bill Payment",
-            description = "[DEMO - FICTIONAL] Partial Credit Card Bill Payment",
+            description = "[DEMO] Partial HDFC Credit Card Bill Settlement",
             isDemo = true
         )
-        // 13. Investment purchase: ₹10,000 from bank
+        // 15. Equity Index Fund Purchase: ₹10,000 from primary bank
         addInvestment(
-            name = "[DEMO - FICTIONAL] Nifty 50 Index Fund",
+            name = "[DEMO] UTI Nifty 50 Index Direct Plan",
             category = InvestmentCategory.MUTUAL_FUND,
             purchaseDateEpochDay = demoDate(0),
-            quantity = 1.0,
+            quantity = 50.0,
             units = 50.0,
             purchasePricePerUnitPaise = 200_00L,
             investedAmountPaise = 10_000_00L,
-            currentRecordedValuePaise = 10_000_00L,
+            currentRecordedValuePaise = 10_850_00L,
             isCurrentValueRecorded = true,
+            annualInterestRatePercent = 18.5,
             paymentAccountId = bankId,
-            notes = "Fictional demonstration investment record",
+            notes = "50 Index Units • Current NAV ₹217",
             isDemo = true
         )
     }

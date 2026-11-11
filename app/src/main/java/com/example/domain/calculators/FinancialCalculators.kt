@@ -263,4 +263,167 @@ object FinancialCalculators {
         }
         return null
     }
+
+    data class InvestmentGrowthAnalysis(
+        val units: Double,
+        val purchasePricePerUnitPaise: Long,
+        val currentPricePerUnitPaise: Long,
+        val investedPaise: Long,
+        val effectiveCurrentValuePaise: Long,
+        val unrealizedGainPaise: Long,
+        val totalNetGainPaise: Long,
+        val holdingDays: Long,
+        val absoluteReturnPercent: Double,
+        val annualizedGrowthRatePercent: Double,
+        val monthlyGrowthRatePercent: Double,
+        val projectedOneYearValuePaise: Long,
+        val projectedMaturityValuePaise: Long?,
+        val projectedMaturityGainPaise: Long?
+    )
+
+    /**
+     * Comprehensive investment valuation & growing-rate calculator.
+     * Calculates current value of shares/units/holdings and their growing rate from:
+     * 1. Share/Unit quantity & current unit price (if provided), OR
+     * 2. Explicit current recorded value (if provided), OR
+     * 3. Compound/simple growth from annual growth/interest rate over elapsed holding days (or tenure).
+     */
+    fun analyzeInvestmentGrowth(
+        units: Double,
+        purchasePricePerUnitPaise: Long,
+        investedAmountPaise: Long,
+        currentRecordedValuePaise: Long?,
+        isCurrentValueRecorded: Boolean,
+        currentUnitPricePaise: Long? = null,
+        annualGrowthOrInterestRatePercent: Double? = null,
+        compoundingPeriodsPerYear: Int = 4,
+        durationMonths: Int? = null,
+        holdingDays: Long = 365L,
+        chargesPaise: Long = 0L,
+        dividendsAndInterestPaise: Long = 0L,
+        isRecurringMonthly: Boolean = false
+    ): InvestmentGrowthAnalysis {
+        val safeUnits = if (units > 0.0) units else 1.0
+        val effectiveInvestedPaise = when {
+            investedAmountPaise > 0L -> investedAmountPaise
+            purchasePricePerUnitPaise > 0L -> BigDecimal.valueOf(safeUnits * purchasePricePerUnitPaise)
+                .setScale(0, RoundingMode.HALF_UP).toLong()
+            else -> 0L
+        }
+        val effectiveBuyPricePerUnit = when {
+            purchasePricePerUnitPaise > 0L -> purchasePricePerUnitPaise
+            effectiveInvestedPaise > 0L -> BigDecimal.valueOf(effectiveInvestedPaise.toDouble() / safeUnits)
+                .setScale(0, RoundingMode.HALF_UP).toLong()
+            else -> 0L
+        }
+
+        val safeHoldingDays = holdingDays.coerceAtLeast(1L)
+        val elapsedYears = (safeHoldingDays / 365.25).coerceAtLeast(1.0 / 365.25)
+
+        // Determine current value from: (1) current share/unit price, (2) recorded current value, (3) growth rate compounding
+        val computedFromRatePaise: Long? = if (
+            effectiveInvestedPaise > 0L &&
+            annualGrowthOrInterestRatePercent != null &&
+            annualGrowthOrInterestRatePercent != 0.0
+        ) {
+            val rateDec = annualGrowthOrInterestRatePercent / 100.0
+            val rawVal = if (compoundingPeriodsPerYear <= 0) {
+                effectiveInvestedPaise * (1.0 + rateDec * elapsedYears)
+            } else {
+                val n = compoundingPeriodsPerYear.toDouble()
+                effectiveInvestedPaise * (1.0 + rateDec / n).pow(n * elapsedYears)
+            }
+            BigDecimal.valueOf(rawVal.coerceAtLeast(0.0)).setScale(0, RoundingMode.HALF_UP).toLong()
+        } else null
+
+        val effectiveCurrentValuePaise = when {
+            currentUnitPricePaise != null && currentUnitPricePaise > 0L ->
+                BigDecimal.valueOf(safeUnits * currentUnitPricePaise).setScale(0, RoundingMode.HALF_UP).toLong()
+            isCurrentValueRecorded && currentRecordedValuePaise != null && currentRecordedValuePaise > 0L ->
+                currentRecordedValuePaise
+            computedFromRatePaise != null && computedFromRatePaise > 0L ->
+                computedFromRatePaise
+            else -> effectiveInvestedPaise
+        }
+
+        val effectiveCurrentUnitPrice = if (effectiveCurrentValuePaise > 0L) {
+            BigDecimal.valueOf(effectiveCurrentValuePaise.toDouble() / safeUnits)
+                .setScale(0, RoundingMode.HALF_UP).toLong()
+        } else 0L
+
+        val unrealizedGain = effectiveCurrentValuePaise - effectiveInvestedPaise
+        val totalNetGain = unrealizedGain + dividendsAndInterestPaise - chargesPaise
+        val absReturnPct = calculateAbsoluteReturnPercent(effectiveInvestedPaise, effectiveCurrentValuePaise)
+
+        // Calculate annualized growing rate (CAGR % p.a.)
+        val annualizedGrowthPct: Double = when {
+            effectiveInvestedPaise > 0L && effectiveCurrentValuePaise > 0L && effectiveCurrentValuePaise != effectiveInvestedPaise -> {
+                val effectiveDaysForCagr = safeHoldingDays.coerceAtLeast(30L)
+                val yrs = effectiveDaysForCagr / 365.25
+                val ratio = effectiveCurrentValuePaise.toDouble() / effectiveInvestedPaise.toDouble()
+                val rawCagr = ((ratio.pow(1.0 / yrs) - 1.0) * 100.0).coerceIn(-99.0, 999.99)
+                if (rawCagr.isNaN() || rawCagr.isInfinite()) (annualGrowthOrInterestRatePercent ?: 0.0)
+                else BigDecimal.valueOf(rawCagr).setScale(2, RoundingMode.HALF_UP).toDouble()
+            }
+            annualGrowthOrInterestRatePercent != null ->
+                BigDecimal.valueOf(annualGrowthOrInterestRatePercent).setScale(2, RoundingMode.HALF_UP).toDouble()
+            else -> 0.0
+        }
+
+        val monthlyGrowthPct = if (annualizedGrowthPct != 0.0) {
+            val mRate = ((1.0 + (annualizedGrowthPct / 100.0).coerceAtLeast(-0.95)).pow(1.0 / 12.0) - 1.0) * 100.0
+            BigDecimal.valueOf(mRate).setScale(2, RoundingMode.HALF_UP).toDouble()
+        } else 0.0
+
+        val effectiveRateForProjection = annualGrowthOrInterestRatePercent ?: annualizedGrowthPct
+        val projectedOneYearPaise = if (effectiveCurrentValuePaise > 0L && effectiveRateForProjection != 0.0) {
+            val r = effectiveRateForProjection / 100.0
+            val projected = if (compoundingPeriodsPerYear <= 0) {
+                effectiveCurrentValuePaise * (1.0 + r)
+            } else {
+                val n = compoundingPeriodsPerYear.toDouble()
+                effectiveCurrentValuePaise * (1.0 + r / n).pow(n)
+            }
+            BigDecimal.valueOf(projected.coerceAtLeast(0.0)).setScale(0, RoundingMode.HALF_UP).toLong()
+        } else effectiveCurrentValuePaise
+
+        val maturityPair: Pair<Long, Long>? = if (
+            durationMonths != null && durationMonths > 0 && effectiveInvestedPaise > 0L && effectiveRateForProjection > 0.0
+        ) {
+            if (isRecurringMonthly) {
+                val monthlyInst = (effectiveInvestedPaise / durationMonths.coerceAtLeast(1)).coerceAtLeast(1L)
+                calculateRecurringDepositMaturity(
+                    monthlyInstallmentPaise = monthlyInst,
+                    annualRatePercent = effectiveRateForProjection,
+                    tenureMonths = durationMonths,
+                    compoundingPerYear = compoundingPeriodsPerYear
+                )
+            } else {
+                calculateFixedDepositMaturity(
+                    principalPaise = effectiveInvestedPaise,
+                    annualRatePercent = effectiveRateForProjection,
+                    durationMonths = durationMonths,
+                    compoundingPerYear = compoundingPeriodsPerYear
+                )
+            }
+        } else null
+
+        return InvestmentGrowthAnalysis(
+            units = safeUnits,
+            purchasePricePerUnitPaise = effectiveBuyPricePerUnit,
+            currentPricePerUnitPaise = effectiveCurrentUnitPrice,
+            investedPaise = effectiveInvestedPaise,
+            effectiveCurrentValuePaise = effectiveCurrentValuePaise,
+            unrealizedGainPaise = unrealizedGain,
+            totalNetGainPaise = totalNetGain,
+            holdingDays = safeHoldingDays,
+            absoluteReturnPercent = absReturnPct,
+            annualizedGrowthRatePercent = annualizedGrowthPct,
+            monthlyGrowthRatePercent = monthlyGrowthPct,
+            projectedOneYearValuePaise = projectedOneYearPaise,
+            projectedMaturityValuePaise = maturityPair?.first,
+            projectedMaturityGainPaise = maturityPair?.second
+        )
+    }
 }
+

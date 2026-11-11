@@ -459,6 +459,12 @@ fun DashboardScreen(
                         }
                     }
 
+                    Text(
+                        text = "Balance Sheet Formula: Cash & Bank + Wealth & Investments + Other Assets − Liabilities",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = VaultTextSecondary
+                    )
+
                     Spacer(modifier = Modifier.height(10.dp))
                     HorizontalDivider(color = VaultCardElevated)
                     Spacer(modifier = Modifier.height(10.dp))
@@ -467,6 +473,26 @@ fun DashboardScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        MetricColumn(
+                            modifier = Modifier.weight(1f),
+                            label = "Cash & Bank",
+                            value = if (!hasRecords) "Not recorded"
+                            else InrMoney.formatPaise(
+                                bs.currentCashAndEquivalentsPaise + bs.currentBankBalancesPaise,
+                                isHidden = isHidden
+                            ),
+                            valueColor = VaultCyan
+                        )
+                        MetricColumn(
+                            modifier = Modifier.weight(1f),
+                            label = "Wealth & Inv.",
+                            value = if (!hasRecords) "Not recorded"
+                            else InrMoney.formatPaise(
+                                bs.nonCurrentInvestmentsPaise + bs.nonCurrentPropertyAndOtherPaise + bs.currentOtherAssetsPaise,
+                                isHidden = isHidden
+                            ),
+                            valueColor = VaultGold
+                        )
                         MetricColumn(
                             modifier = Modifier.weight(1f),
                             label = "Total Assets",
@@ -480,16 +506,6 @@ fun DashboardScreen(
                             value = if (!hasRecords) "Not recorded"
                             else InrMoney.formatPaise(bs.totalLiabilitiesPaise, isHidden = isHidden),
                             valueColor = if (bs.totalLiabilitiesPaise > 0) VaultCoral else VaultTextPrimary
-                        )
-                        MetricColumn(
-                            modifier = Modifier.weight(1f),
-                            label = "Cash & Bank",
-                            value = if (uiState.accountsWithBalances.isEmpty()) "Not provided"
-                            else InrMoney.formatPaise(
-                                bs.currentCashAndEquivalentsPaise + bs.currentBankBalancesPaise,
-                                isHidden = isHidden
-                            ),
-                            valueColor = VaultCyan
                         )
                     }
                 }
